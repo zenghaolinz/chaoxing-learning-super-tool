@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答案导出器
 // @namespace    https://github.com/zenghaolinz/chaoxing-answer-exporter
-// @version      1.2.1
+// @version      1.2.2
 // @description  采集超星学习通题目与正确答案，支持逐题换页、长卷同页、随堂练习、AI自动答题、显示答案跳转和断点恢复
 // @author       zenghaolinz
 // @license      MIT
@@ -24,7 +24,7 @@
     const APP = Object.freeze({
         id: 'cx-answer-exporter',
         name: '超星答案导出器',
-        version: '1.2.1',
+        version: '1.2.2',
         storageVersion: 1,
         sessionPrefix: 'CXAE_SESSION_',
         settingsKey: 'CXAE_SETTINGS',
@@ -37,9 +37,9 @@
     const DEFAULT_SETTINGS = Object.freeze({
         autoRevealAnswer: true,
         includeTimestamp: true,
-        aiApiBase: 'https://api.deepseek.com/v1',
+        aiApiBase: 'https://api.deepseek.com',
         aiApiKey: '',
-        aiModel: 'deepseek-chat',
+        aiModel: 'deepseek-v4-flash',
         autoFillDelay: 500,
     });
 
@@ -109,6 +109,14 @@
             try {
                 const parsed = JSON.parse(localStorage.getItem(APP.settingsKey) || '{}');
                 const settings = { ...DEFAULT_SETTINGS, ...parsed };
+                // 兼容旧版 DeepSeek 配置。仅迁移官方 API，不影响第三方 OpenAI 兼容服务。
+                if (/^https:\/\/api\.deepseek\.com\/v1\/?$/i.test(normalizeText(settings.aiApiBase))) {
+                    settings.aiApiBase = 'https://api.deepseek.com';
+                }
+                if (/api\.deepseek\.com/i.test(normalizeText(settings.aiApiBase))) {
+                    if (settings.aiModel === 'deepseek-chat') settings.aiModel = 'deepseek-v4-flash';
+                    if (settings.aiModel === 'deepseek-reasoner') settings.aiModel = 'deepseek-v4-pro';
+                }
                 // 从 GM 安全存储读取 API Key（如果可用）
                 if (typeof GM_getValue === 'function') {
                     const secureKey = GM_getValue('CXAE_AI_API_KEY', '');
@@ -1492,27 +1500,21 @@
             let typeInstruction = '';
             const cleanType = normalizeText(type || '');
             if (/单选/.test(cleanType)) {
-                typeInstruction = '这是单选题，请从选项中选择唯一正确答案，返回选项字母（如 A）。';
+                typeInstruction = '这是单选题，只返回唯一正确选项字母，例如：A';
             } else if (/多选/.test(cleanType)) {
-                typeInstruction = '这是多选题，请选择所有正确答案，返回选项字母用逗号分隔（如 A,C）。';
+                typeInstruction = '这是多选题，只返回所有正确选项字母，用英文逗号分隔，例如：A,C';
             } else if (/判断/.test(cleanType)) {
-                typeInstruction = '这是判断题，请判断对错，返回"对"或"错"。';
+                typeInstruction = '这是判断题，只返回“对”或“错”。';
             } else if (/填空/.test(cleanType)) {
-                typeInstruction = '这是填空题，多个空用 | 分隔返回答案（如：答案1|答案2）。';
+                typeInstruction = '这是填空题，只返回答案；多个空用 | 分隔。';
             } else if (/简答|论述|问答/.test(cleanType)) {
-                typeInstruction = '这是简答题，请给出简要准确的答案文本。';
+                typeInstruction = '这是简答题，只返回简明、准确的答案正文。';
             } else {
-                typeInstruction = '请根据题目内容判断题型并给出正确答案。单选返回字母，多选返回逗号分隔字母，判断返回"对"或"错"，填空用|分隔，简答返回文本。';
+                typeInstruction = '请判断题型并只返回答案本身：单选返回一个字母，多选返回逗号分隔字母，判断返回“对”或“错”，填空多空用 | 分隔。';
             }
 
-            return `你是一个精准的考试答题助手。请根据题目和选项给出正确答案。
-
-${typeInstruction}
-
-你必须严格按以下 JSON 格式返回，不要输出任何其他内容：
-{"answer": "你的答案", "confidence": 0.95}
-
-confidence 为你对答案正确性的自信程度，范围 0 到 1。
+            return `${typeInstruction}
+不要解释，不要复述题目，不要使用 Markdown，不要输出 JSON。
 
 题目：${question}
 
@@ -1520,25 +1522,65 @@ confidence 为你对答案正确性的自信程度，范围 0 到 1。
 ${optionsText}`;
         }
 
-        async chat(messages, { jsonMode = false } = {}) {
+        resolveProviderSettings() {
             const settings = this.getSettings();
-            const apiBase = normalizeText(settings.aiApiBase || 'https://api.deepseek.com/v1');
+            let apiBase = normalizeText(settings.aiApiBase || 'https://api.deepseek.com');
             const apiKey = normalizeText(settings.aiApiKey || '');
-            const model = normalizeText(settings.aiModel || 'deepseek-chat');
+            let model = normalizeText(settings.aiModel || 'deepseek-v4-flash');
 
             if (!apiKey) throw new Error('未配置 AI API Key，请在设置中填写');
             if (!/^https?:\/\//i.test(apiBase)) throw new Error('AI API 地址格式不正确');
+
+            let isOfficialDeepSeek = false;
+            try {
+                const parsed = new URL(apiBase);
+                isOfficialDeepSeek = parsed.hostname.toLowerCase() === 'api.deepseek.com';
+            } catch {
+                throw new Error('AI API 地址格式不正确');
+            }
+
+            if (isOfficialDeepSeek) {
+                apiBase = apiBase.replace(/\/v1\/?$/i, '');
+                if (model === 'deepseek-chat') model = 'deepseek-v4-flash';
+                if (model === 'deepseek-reasoner') model = 'deepseek-v4-pro';
+            }
 
             const normalizedBase = apiBase.replace(/\/+$/, '');
             const url = /\/chat\/completions$/i.test(normalizedBase)
                 ? normalizedBase
                 : `${normalizedBase}/chat/completions`;
+
+            return { apiKey, model, url, isOfficialDeepSeek };
+        }
+
+        normalizeMessageContent(value) {
+            if (typeof value === 'string') return value;
+            if (Array.isArray(value)) {
+                return value.map(part => {
+                    if (typeof part === 'string') return part;
+                    return part?.text ?? part?.content ?? part?.value ?? '';
+                }).join('');
+            }
+            if (value && typeof value === 'object') {
+                return String(value.text ?? value.content ?? value.value ?? value.answer ?? '');
+            }
+            return '';
+        }
+
+        async chat(messages, { jsonMode = false, retryWithoutJson = true } = {}) {
+            const provider = this.resolveProviderSettings();
             const payload = {
-                model,
+                model: provider.model,
                 messages,
                 temperature: 0.1,
-                max_tokens: 512,
+                max_tokens: 1024,
             };
+
+            // DeepSeek V4 默认可能进入思考模式。答题只需要简短最终答案，关闭思考可避免
+            // 输出额度被 reasoning_content 消耗后 content 为空。
+            if (provider.isOfficialDeepSeek && /^deepseek-v4-/i.test(provider.model)) {
+                payload.thinking = { type: 'disabled' };
+            }
             if (jsonMode) payload.response_format = { type: 'json_object' };
 
             const describeHttpError = (status, statusText, bodyText = '') => {
@@ -1563,25 +1605,43 @@ ${optionsText}`;
 
             const readContent = data => {
                 if (data?.error) throw new Error(data.error.message || `API 错误：${JSON.stringify(data.error)}`);
-                const content = data?.choices?.[0]?.message?.content;
-                if (Array.isArray(content)) {
-                    return content.map(part => part?.text || part?.content || '').join('');
+                const choice = data?.choices?.[0];
+                const message = choice?.message || {};
+                const content = this.normalizeMessageContent(message.content ?? choice?.text).trim();
+                if (content) return content;
+
+                // 兼容思考模型或部分 OpenAI 兼容接口：最终 content 为空时，使用其返回的
+                // reasoning_content 作为解析兜底，不在界面展示完整思考文本。
+                const reasoning = this.normalizeMessageContent(message.reasoning_content).trim();
+                if (reasoning) return reasoning;
+
+                const finishReason = normalizeText(choice?.finish_reason || '');
+                console.warn('[CXAE] API 返回空内容', {
+                    model: data?.model || provider.model,
+                    finishReason,
+                    usage: data?.usage || null,
+                });
+                if (finishReason === 'length') {
+                    throw new Error('AI 输出达到长度上限但没有最终答案，请重试');
                 }
-                if (typeof content !== 'string' || !content.trim()) {
-                    throw new Error('API 未返回有效答案，请检查模型名称或账户状态');
+                if (finishReason === 'content_filter') {
+                    throw new Error('AI 回复被内容过滤，未返回答案');
                 }
-                return content;
+                if (finishReason === 'insufficient_system_resource') {
+                    throw new Error('AI 服务资源不足，请稍后重试');
+                }
+                throw new Error(`API 返回空内容（模型：${data?.model || provider.model}${finishReason ? `，结束原因：${finishReason}` : ''}）`);
             };
 
-            return new Promise((resolve, reject) => {
+            const requestOnce = requestPayload => new Promise((resolve, reject) => {
                 if (typeof GM_xmlhttpRequest === 'undefined') {
-                    fetch(url, {
+                    fetch(provider.url, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${apiKey}`,
+                            'Authorization': `Bearer ${provider.apiKey}`,
                         },
-                        body: JSON.stringify(payload),
+                        body: JSON.stringify(requestPayload),
                     })
                     .then(async response => {
                         const text = await response.text();
@@ -1599,12 +1659,12 @@ ${optionsText}`;
 
                 GM_xmlhttpRequest({
                     method: 'POST',
-                    url,
+                    url: provider.url,
                     headers: {
                         'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${apiKey}`,
+                        'Authorization': `Bearer ${provider.apiKey}`,
                     },
-                    data: JSON.stringify(payload),
+                    data: JSON.stringify(requestPayload),
                     onload(response) {
                         const status = Number(response.status) || 0;
                         if (status < 200 || status >= 300) {
@@ -1626,17 +1686,31 @@ ${optionsText}`;
                     ontimeout() {
                         reject(new Error('API 请求超时，请稍后重试或调大答题间隔'));
                     },
-                    timeout: 30000,
+                    timeout: 45000,
                 });
             });
+
+            try {
+                return await requestOnce(payload);
+            } catch (error) {
+                // DeepSeek 官方说明 JSON Output 偶尔会返回空 content。遇到这种情况自动去掉
+                // response_format 重试一次，避免整道题直接失败。
+                if (jsonMode && retryWithoutJson && /空内容|有效答案|长度上限/i.test(error?.message || '')) {
+                    const fallbackPayload = { ...payload };
+                    delete fallbackPayload.response_format;
+                    return requestOnce(fallbackPayload);
+                }
+                throw error;
+            }
         }
 
-        parseAIResponse(content) {
+        parseAIResponse(content, expectedType = '') {
             if (!content) return { answer: '', confidence: 0 };
             const text = String(content)
-                .replace(/^\s*```(?:json)?\s*/i, '')
+                .replace(/^\s*```(?:json|text)?\s*/i, '')
                 .replace(/\s*```\s*$/i, '')
                 .trim();
+            if (!text) return { answer: '', confidence: 0 };
 
             const normalizeAnswer = value => {
                 if (Array.isArray(value)) return value.map(normalizeText).filter(Boolean).join(',');
@@ -1656,7 +1730,7 @@ ${optionsText}`;
             for (const candidate of candidates) {
                 try {
                     const parsed = JSON.parse(candidate);
-                    const answer = normalizeAnswer(parsed?.answer);
+                    const answer = normalizeAnswer(parsed?.answer ?? parsed?.result ?? parsed?.response);
                     if (answer) {
                         return {
                             answer,
@@ -1666,16 +1740,22 @@ ${optionsText}`;
                 } catch { /* 尝试后续回退 */ }
             }
 
-            const answerField = text.match(/["']?answer["']?\s*[:：]\s*["']([^"']+)["']/i);
+            const answerField = text.match(/["']?(?:answer|答案)["']?\s*[:：]\s*["']?([^"'\n}]+)["']?/i);
             if (answerField?.[1]) {
                 return { answer: normalizeText(answerField[1]), confidence: 0.5 };
             }
 
             const lines = text.split('\n').map(normalizeText).filter(Boolean);
-            for (const line of lines) {
+            // 优先从末尾寻找最终答案，兼容带有少量解释或 reasoning_content 的接口。
+            for (const line of lines.slice().reverse()) {
                 const cleaned = line
-                    .replace(/^(?:答案|answer)\s*[:：]\s*/i, '')
-                    .replace(/^(["'])|(["'])$/g, '');
+                    .replace(/^[-*#>\s]+/, '')
+                    .replace(/^(?:最终答案|正确答案|答案|answer)\s*[:：]\s*/i, '')
+                    .replace(/^(?:选项)\s*/i, '')
+                    .replace(/^(?:["'])|(?:["'])$/g, '')
+                    .replace(/[。.!！]+$/, '')
+                    .trim();
+
                 if (/^[A-HＡ-Ｈ](?:\s*[,，、\s]\s*[A-HＡ-Ｈ])*$/.test(cleaned) || /^[A-HＡ-Ｈ]{1,8}$/.test(cleaned)) {
                     const answer = cleaned
                         .replace(/[Ａ-Ｈ]/g, character => String.fromCharCode(character.charCodeAt(0) - 0xFEE0))
@@ -1687,21 +1767,48 @@ ${optionsText}`;
                 }
             }
 
-            const plain = lines.find(line => !/^[{[]/.test(line));
-            return plain
-                ? { answer: plain.replace(/^(?:答案|answer)\s*[:：]\s*/i, ''), confidence: 0.3 }
-                : { answer: '', confidence: 0 };
+            const cleanType = normalizeText(expectedType || '');
+            if (/单选/.test(cleanType)) {
+                const match = text.match(/(?:最终答案|正确答案|答案|answer|选项)?\s*[:：为是]?\s*\b([A-H])\b(?!\s*[,，、]\s*[A-H])/i);
+                if (match?.[1]) return { answer: match[1].toUpperCase(), confidence: 0.4 };
+            }
+            if (/多选/.test(cleanType)) {
+                const match = text.match(/(?:最终答案|正确答案|答案|answer|选项)?\s*[:：为是]?\s*([A-H](?:\s*[,，、\s]\s*[A-H])+)/i);
+                if (match?.[1]) {
+                    return { answer: match[1].replace(/[，、\s]+/g, ',').toUpperCase(), confidence: 0.4 };
+                }
+            }
+            if (/判断/.test(cleanType)) {
+                const matches = Array.from(text.matchAll(/(?:^|[：:\s])(对|错|正确|错误)(?=$|[。.!！\s])/g));
+                if (matches.length) return { answer: matches[matches.length - 1][1], confidence: 0.4 };
+            }
+
+            // 简答、填空等文本题保留模型正文；选择题不把解释性长文本误当答案。
+            if (!/单选|多选|判断/.test(cleanType) && text.length <= 2000) {
+                return { answer: text, confidence: 0.3 };
+            }
+            return { answer: '', confidence: 0 };
         }
 
         async answerQuestion({ type, question, options }) {
             const prompt = this.buildPrompt({ type, question, options });
             const messages = [
-                { role: 'system', content: '你是一个精准的考试答题助手。请严格按照要求格式返回答案，只输出 JSON，不要输出解释。' },
+                { role: 'system', content: '你是考试答题助手。只输出最终答案本身，不要解释，不要 Markdown，不要 JSON。' },
                 { role: 'user', content: prompt },
             ];
 
-            const content = await this.chat(messages, { jsonMode: true });
-            return this.parseAIResponse(content);
+            let content = await this.chat(messages, { jsonMode: false });
+            let result = this.parseAIResponse(content, type);
+            if (normalizeText(result.answer)) return result;
+
+            // 第一次回复为空白或不可解析时，用更短的提示再试一次。
+            const retryMessages = [
+                { role: 'system', content: '只返回答案，不要解释。' },
+                { role: 'user', content: `${prompt}\n\n再次强调：只输出最终答案。` },
+            ];
+            content = await this.chat(retryMessages, { jsonMode: false });
+            result = this.parseAIResponse(content, type);
+            return result;
         }
 
         async testConnection() {
@@ -1711,7 +1818,7 @@ ${optionsText}`;
             const messages = [
                 { role: 'user', content: '请只回复：连接成功' },
             ];
-            const content = await this.chat(messages);
+            const content = await this.chat(messages, { jsonMode: false });
             return Boolean(normalizeText(content));
         }
     }
@@ -2098,13 +2205,13 @@ ${optionsText}`;
                                 <div class="input-row">
                                     <div style="flex: 1;">
                                         <label class="input-label">API 地址</label>
-                                        <input class="input-field" type="text" data-setting="aiApiBase" placeholder="https://api.deepseek.com/v1">
+                                        <input class="input-field" type="text" data-setting="aiApiBase" placeholder="https://api.deepseek.com">
                                     </div>
                                 </div>
                                 <div class="input-row">
                                     <div style="flex: 1;">
                                         <label class="input-label">模型</label>
-                                        <input class="input-field" type="text" data-setting="aiModel" placeholder="deepseek-chat">
+                                        <input class="input-field" type="text" data-setting="aiModel" placeholder="deepseek-v4-flash">
                                     </div>
                                     <button class="btn-sm" type="button" data-action="test-ai">测试连接</button>
                                 </div>

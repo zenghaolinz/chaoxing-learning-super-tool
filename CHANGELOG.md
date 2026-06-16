@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.2 - 2026-06-16
+
+### Added
+
+- 兼容 AI 思考模型：当 `content` 为空时，使用 `reasoning_content` 作为解析兜底；
+- API 返回空内容时增加 `finish_reason` 判断（`length`、`content_filter`、`insufficient_system_resource`）；
+- 无 `GM_xmlhttpRequest` 时自动回退到 `fetch` 请求。
+
+### Changed
+
+- 默认 API 地址改为 `https://api.deepseek.com`（去掉 `/v1` 后缀）；
+- 默认模型改为 `deepseek-v4-flash`。
+
 ## 1.2.1 - 2026-06-16
 
 ### Added
@@ -41,7 +54,7 @@
 
 - 逐题换页采集与跨页面断点恢复
 - 长卷同页采集与懒加载等待
-- 未作答题“显示答案”处理
+- 未作答题"显示答案"处理
 - 大题量题库支持
 - 按试卷隔离本地采集状态
 - 跳转循环保护
