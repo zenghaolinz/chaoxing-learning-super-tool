@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.1 - 2026-06-16
+
+### Added
+
+- AI 自动答题：通过 DeepSeek 等 OpenAI 兼容 API 自动生成答案并回填；
+- AI 答题设置面板：API 地址、API Key、模型名称、填充间隔；
+- API Key 使用 `GM_setValue` / `GM_getValue` 安全存储，不写入 `localStorage`；
+- 已采集答案回填功能：将采集到的正确答案自动填入当前页面对应题目；
+- `AIClient` 模块：构建 Prompt、调用 API、解析响应；
+- `AutoFiller` 模块：匹配题目节点并自动填写答案；
+- 申请新权限：`GM_xmlhttpRequest`、`GM_getValue`、`GM_setValue`、`GM_deleteValue`；
+- 新增 `@connect api.deepseek.com` 和 `@connect *`。
+
+### Changed
+
+- `SettingsStore` 支持敏感字段分离存储；
+- 默认 AI 配置为 `deepseek-chat`，API 地址 `https://api.deepseek.com/v1`。
+
 ## 1.1.0 - 2026-06-16
 
 ### Added

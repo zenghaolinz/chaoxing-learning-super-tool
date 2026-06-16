@@ -1,18 +1,21 @@
 // ==UserScript==
 // @name         超星答案导出器
 // @namespace    https://github.com/zenghaolinz/chaoxing-answer-exporter
-// @version      1.1.0
-// @description  采集超星学习通题目与正确答案，支持逐题换页、长卷同页、随堂练习、显示答案跳转和断点恢复
+// @version      1.2.1
+// @description  采集超星学习通题目与正确答案，支持逐题换页、长卷同页、随堂练习、AI自动答题、显示答案跳转和断点恢复
 // @author       zenghaolinz
 // @license      MIT
 // @homepageURL  https://github.com/zenghaolinz/chaoxing-answer-exporter
 // @supportURL   https://github.com/zenghaolinz/chaoxing-answer-exporter/issues
-// @downloadURL  https://raw.githubusercontent.com/zenghaolinz/chaoxing-answer-exporter/main/chaoxing-answer-exporter.user.js
-// @updateURL    https://raw.githubusercontent.com/zenghaolinz/chaoxing-answer-exporter/main/chaoxing-answer-exporter.user.js
 // @match        *://*.chaoxing.com/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
 // @run-at       document-idle
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @connect      api.deepseek.com
+// @connect      *
 // ==/UserScript==
 
 (() => {
@@ -21,7 +24,7 @@
     const APP = Object.freeze({
         id: 'cx-answer-exporter',
         name: '超星答案导出器',
-        version: '1.1.0',
+        version: '1.2.1',
         storageVersion: 1,
         sessionPrefix: 'CXAE_SESSION_',
         settingsKey: 'CXAE_SETTINGS',
@@ -34,6 +37,10 @@
     const DEFAULT_SETTINGS = Object.freeze({
         autoRevealAnswer: true,
         includeTimestamp: true,
+        aiApiBase: 'https://api.deepseek.com/v1',
+        aiApiKey: '',
+        aiModel: 'deepseek-chat',
+        autoFillDelay: 500,
     });
 
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -101,7 +108,13 @@
         load() {
             try {
                 const parsed = JSON.parse(localStorage.getItem(APP.settingsKey) || '{}');
-                return { ...DEFAULT_SETTINGS, ...parsed };
+                const settings = { ...DEFAULT_SETTINGS, ...parsed };
+                // 从 GM 安全存储读取 API Key（如果可用）
+                if (typeof GM_getValue === 'function') {
+                    const secureKey = GM_getValue('CXAE_AI_API_KEY', '');
+                    if (secureKey) settings.aiApiKey = secureKey;
+                }
+                return settings;
             } catch (error) {
                 console.warn('[CXAE] 读取设置失败，使用默认值。', error);
                 return { ...DEFAULT_SETTINGS };
@@ -109,9 +122,29 @@
         }
 
         save(settings) {
+            // API Key 优先存入用户脚本管理器，避免明文写入页面 localStorage。
+            const safeCopy = { ...settings };
+            delete safeCopy.aiApiKey;
+
+            if (typeof GM_setValue === 'function') {
+                if (settings.aiApiKey) {
+                    GM_setValue('CXAE_AI_API_KEY', settings.aiApiKey);
+                } else if (typeof GM_deleteValue === 'function') {
+                    GM_deleteValue('CXAE_AI_API_KEY');
+                } else {
+                    GM_setValue('CXAE_AI_API_KEY', '');
+                }
+                localStorage.setItem(APP.settingsKey, JSON.stringify(safeCopy));
+                return;
+            }
+
             localStorage.setItem(APP.settingsKey, JSON.stringify(settings));
         }
     }
+
+    let _vuePracticeCache = null;
+    let _vuePracticeCacheTime = 0;
+    const VUE_CACHE_TTL = 2000; // Vue 上下文缓存 2 秒
 
     class ChaoxingAdapter {
         getScope() {
@@ -151,28 +184,104 @@
         }
 
         getVuePracticeContext() {
-            const instances = [];
+            // 同时兼容 Vue 2 的 __vue__ 与 Vue 3 的 __vueParentComponent__。
+            const now = Date.now();
+            if (_vuePracticeCache && now - _vuePracticeCacheTime < VUE_CACHE_TTL) {
+                return _vuePracticeCache;
+            }
+
             const seen = new Set();
-            const direct = document.querySelector('#main')?.__vue__;
-            if (direct) {
-                instances.push(direct);
-                seen.add(direct);
-            }
+            const listKeys = ['questionList', 'questions', 'topicList', 'subjectList'];
 
-            for (const element of document.querySelectorAll('*')) {
-                const vm = element.__vue__;
-                if (!vm || seen.has(vm)) continue;
-                seen.add(vm);
-                instances.push(vm);
-            }
+            const inspectInstance = instance => {
+                let current = instance;
+                let depth = 0;
 
-            for (const vm of instances) {
-                const data = vm?.$data;
-                const list = data?.questionList;
-                if (Array.isArray(list) && list.length > 0) {
-                    return { vm, data, list };
+                while (current && depth < 40) {
+                    if (seen.has(current)) break;
+                    seen.add(current);
+
+                    const sources = [];
+                    try {
+                        sources.push(
+                            current.$data,
+                            current.proxy?.$data,
+                            current.setupState,
+                            current.data,
+                            current.ctx,
+                            current.proxy
+                        );
+                    } catch { /* 某些 Vue Proxy 属性可能抛错 */ }
+
+                    const usable = sources.filter(source => source && typeof source === 'object');
+                    for (const source of usable) {
+                        for (const key of listKeys) {
+                            let list;
+                            try { list = source[key]; } catch { list = null; }
+                            if (!Array.isArray(list) || !list.length) continue;
+
+                            let active = null;
+                            for (const candidate of usable) {
+                                try {
+                                    if (candidate.active) {
+                                        active = candidate.active;
+                                        break;
+                                    }
+                                } catch { /* ignore */ }
+                            }
+
+                            return {
+                                vm: current,
+                                data: { questionList: list, active },
+                                list,
+                            };
+                        }
+                    }
+
+                    current = current.$parent || current.parent || null;
+                    depth += 1;
+                }
+                return null;
+            };
+
+            const inspectElement = element => {
+                if (!element) return null;
+                const instances = [
+                    element.__vue__,
+                    element.__vueParentComponent,
+                    element.__vue_app__?._instance,
+                ].filter(Boolean);
+                for (const instance of instances) {
+                    const result = inspectInstance(instance);
+                    if (result) return result;
+                }
+                return null;
+            };
+
+            const quickCheck = document.querySelectorAll(
+                '#main, #app, .practice, .quiz, [class*="question"], [class*="exam"], [class*="practice"]'
+            );
+            for (const element of quickCheck) {
+                const result = inspectElement(element);
+                if (result) {
+                    _vuePracticeCache = result;
+                    _vuePracticeCacheTime = now;
+                    return result;
                 }
             }
+
+            // 快速检查未找到时再进行全页面扫描。
+            for (const element of document.querySelectorAll('*')) {
+                const result = inspectElement(element);
+                if (result) {
+                    _vuePracticeCache = result;
+                    _vuePracticeCacheTime = now;
+                    return result;
+                }
+            }
+
+            _vuePracticeCache = null;
+            _vuePracticeCacheTime = now;
             return null;
         }
 
@@ -363,34 +472,167 @@
         }
 
         getQuestionNodes() {
-            const primary = Array.from(document.querySelectorAll('.questionLi'));
-            const candidates = primary.length ? primary : Array.from(document.querySelectorAll('.mark_item'));
             const result = [];
+            const seenNodes = new Set();
             const signatures = new Set();
+            const answerSelector = [
+                'input[type="radio"]',
+                'input[type="checkbox"]',
+                'input[type="text"]:not([readonly]):not([disabled])',
+                'textarea:not([readonly]):not([disabled])',
+                '[contenteditable="true"]',
+                '[role="radio"]',
+                '[role="checkbox"]',
+            ].join(',');
+            const containerSelector = [
+                '.questionLi', '.mark_item',
+                '.question-item', '.questionItem',
+                '.subject-item', '.subjectItem',
+                '.topic-item', '.topicItem',
+                '.practice-question', '.practiceQuestion',
+                '[data-question-id]', '[data-questionid]',
+                '[data-question-index]', '[data-topic-id]',
+            ].join(',');
 
-            for (const node of candidates) {
+            const candidates = Array.from(document.querySelectorAll(containerSelector));
+
+            // 页面结构没有标准题目容器时，从可作答控件向上寻找最小的题目块。
+            if (!candidates.length) {
+                const controls = Array.from(document.querySelectorAll(answerSelector))
+                    .filter(control => !control.closest?.(`#${APP.id}-host`));
+
+                for (const control of controls) {
+                    let container = control.closest(containerSelector);
+                    if (!container) {
+                        let current = control.parentElement;
+                        let fallback = null;
+                        for (let depth = 0; current && depth < 9; depth += 1, current = current.parentElement) {
+                            if (current === document.body || current === document.documentElement) break;
+                            const controlCount = current.querySelectorAll(answerSelector).length;
+                            const text = normalizeText(current.innerText || current.textContent || '');
+                            if (controlCount >= 1 && text.length >= 6 && text.length <= 12000) fallback = current;
+                            if (
+                                fallback &&
+                                (this.findTitleNode(current) || this.extractQuestionNumber(text) || controlCount >= 2)
+                            ) {
+                                container = current;
+                                break;
+                            }
+                        }
+                        container ||= fallback;
+                    }
+                    if (container) candidates.push(container);
+                }
+            }
+
+            // 优先保留更小、更接近控件的题目容器，避免把整张试卷当成一道题。
+            const uniqueCandidates = Array.from(new Set(candidates))
+                .filter(node => node?.isConnected && !node.closest?.(`#${APP.id}-host`))
+                .sort((left, right) => {
+                    const leftControls = left.querySelectorAll(answerSelector).length;
+                    const rightControls = right.querySelectorAll(answerSelector).length;
+                    if (leftControls !== rightControls) return leftControls - rightControls;
+                    return normalizeText(left.textContent).length - normalizeText(right.textContent).length;
+                });
+
+            for (const node of uniqueCandidates) {
+                if (seenNodes.has(node)) continue;
+                if (result.some(existing => node.contains(existing))) continue;
+
                 const titleNode = this.findTitleNode(node);
                 const title = normalizeText(titleNode?.textContent || '');
-                const text = title || normalizeText(node.textContent).slice(0, 300);
+                const text = title || normalizeText(node.innerText || node.textContent || '').slice(0, 500);
                 if (!text) continue;
 
-                const signature = `${title}|${text.slice(0, 120)}`;
+                const nodeIndex = result.length;
+                const order = this.extractQuestionNumber(title) ||
+                    this.extractQuestionNumber(node.innerText || node.textContent) ||
+                    (nodeIndex + 1);
+                const signature = `${order}|${text.slice(0, 120)}`;
                 if (signatures.has(signature)) continue;
+
                 signatures.add(signature);
+                seenNodes.add(node);
                 result.push(node);
             }
 
-            return result;
+            return result.sort((left, right) => {
+                if (left === right) return 0;
+                const position = left.compareDocumentPosition(right);
+                return position & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+            });
         }
 
         hasQuestions() {
-            return this.hasVuePracticeQuestions() || this.getQuestionNodes().length > 0;
+            if (this.hasVuePracticeQuestions() || this.getQuestionNodes().length > 0) return true;
+            return Boolean(document.querySelector(
+                'input[type="radio"], input[type="checkbox"], textarea, input[type="text"], [contenteditable="true"], [role="radio"], [role="checkbox"]'
+            ));
         }
 
         findTitleNode(question) {
             return question?.querySelector(
-                '.mark_name, [class*="mark_name"], .question-title, .questionTitle, .subject-title, .title'
+                '.mark_name, [class*="mark_name"], .question-title, .questionTitle, .subject-title, .subjectTitle, .topic-title, .topicTitle, .stem, [class*="question-stem"], [class*="subject-title"], [class*="topic-title"]'
             ) || null;
+        }
+
+        findQuestionNodeForItem(item, nodes = this.getQuestionNodes(), used = new Set()) {
+            if (!item || !nodes?.length) return null;
+            const sourceId = item.sourceId == null ? '' : String(item.sourceId);
+
+            if (sourceId) {
+                const idAttributes = ['data-question-id', 'data-questionid', 'data-id', 'data-topic-id', 'questionid'];
+                for (const node of nodes) {
+                    if (used.has(node)) continue;
+                    const matched = idAttributes.some(attribute => String(node.getAttribute?.(attribute) || '') === sourceId) ||
+                        Array.from(node.querySelectorAll?.('[data-question-id], [data-questionid], [data-id], [data-topic-id], [questionid]') || [])
+                            .some(element => idAttributes.some(attribute => String(element.getAttribute(attribute) || '') === sourceId));
+                    if (matched) return node;
+                }
+            }
+
+            const targetQuestion = normalizeText(item.question || '')
+                .replace(/^\d+\s*[.、．]\s*/, '')
+                .replace(/^[（(][^）)]*题[^）)]*[）)]\s*/, '');
+            const snippet = targetQuestion.slice(0, 36);
+
+            if (snippet) {
+                for (const node of nodes) {
+                    if (used.has(node)) continue;
+                    const nodeText = normalizeText(node.innerText || node.textContent || '');
+                    if (nodeText.includes(snippet) || targetQuestion.includes(nodeText.slice(0, 36))) return node;
+                }
+            }
+
+            const targetOrder = Number(item.order) || 0;
+            if (targetOrder > 0) {
+                for (const node of nodes) {
+                    if (used.has(node)) continue;
+                    const nodeOrder = this.extractQuestionNumber(node.innerText || node.textContent || '');
+                    if (nodeOrder === targetOrder) return node;
+                }
+            }
+
+            return nodes.find(node => !used.has(node)) || null;
+        }
+
+        getAnswerTargets() {
+            const nodes = this.getQuestionNodes();
+            const vueItems = this.getVuePracticeItems();
+
+            if (vueItems.length) {
+                const used = new Set();
+                return vueItems.map((item, index) => {
+                    const node = this.findQuestionNodeForItem(item, nodes, used) || nodes[index] || null;
+                    if (node) used.add(node);
+                    return { node, item };
+                }).filter(target => target.node && target.item);
+            }
+
+            return nodes.map((node, index) => ({
+                node,
+                item: this.parseQuestion(node, index + 1),
+            })).filter(target => target.item);
         }
 
         getLines(question) {
@@ -750,6 +992,272 @@
                 practiceTitle || document.querySelector('.mark_title, .testTit, .exam-title, h1')?.textContent || document.title
             ).replace(/[-_|]\s*超星.*$/i, '') || '超星题目';
         }
+
+        // ---- 自动答题：DOM 填充方法 ----
+
+        findAnswerInputs(questionNode) {
+            if (!questionNode) {
+                return { radios: [], checkboxes: [], textInputs: [], textareas: [], contentEditables: [] };
+            }
+            const radios = Array.from(questionNode.querySelectorAll('input[type="radio"], [role="radio"]'));
+            const checkboxes = Array.from(questionNode.querySelectorAll('input[type="checkbox"], [role="checkbox"]'));
+            const textInputs = Array.from(questionNode.querySelectorAll(
+                'input[type="text"]:not([readonly]):not([disabled]), input:not([type]):not([readonly]):not([disabled])'
+            ));
+            const textareas = Array.from(questionNode.querySelectorAll('textarea:not([readonly]):not([disabled])'));
+            const contentEditables = Array.from(questionNode.querySelectorAll('[contenteditable="true"]'));
+            return { radios, checkboxes, textInputs, textareas, contentEditables };
+        }
+
+        getOptionElements(questionNode) {
+            if (!questionNode) return [];
+            const selectors = [
+                '.mark_letter li', '.answerList li', '.answer-list li',
+                '.question-options li', '.option-item', '.answer-option',
+                '.optionItem', '.answerItem', '[class*="option-item"]',
+                '[class*="answer-item"]', '[role="radio"]', '[role="checkbox"]',
+            ];
+            const result = [];
+            const seen = new Set();
+            for (const selector of selectors) {
+                questionNode.querySelectorAll(selector).forEach(element => {
+                    if (!seen.has(element)) {
+                        seen.add(element);
+                        result.push(element);
+                    }
+                });
+            }
+            return result;
+        }
+
+        normalizeOptionLetter(value) {
+            return normalizeText(value)
+                .replace(/[Ａ-Ｚ]/g, character => String.fromCharCode(character.charCodeAt(0) - 0xFEE0))
+                .toUpperCase();
+        }
+
+        getChoiceTarget(optionElement, preferredType = '') {
+            if (!optionElement) return null;
+            if (optionElement.matches?.('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')) {
+                return optionElement;
+            }
+            const typeSelector = preferredType === 'checkbox'
+                ? 'input[type="checkbox"], [role="checkbox"]'
+                : preferredType === 'radio'
+                    ? 'input[type="radio"], [role="radio"]'
+                    : 'input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]';
+            return optionElement.querySelector(typeSelector) ||
+                optionElement.closest('label, [role="radio"], [role="checkbox"]') ||
+                optionElement;
+        }
+
+        getChoiceState(element) {
+            if (!element) return null;
+            if (element instanceof HTMLInputElement && /^(radio|checkbox)$/i.test(element.type)) {
+                return Boolean(element.checked);
+            }
+            const ariaChecked = element.getAttribute?.('aria-checked');
+            if (ariaChecked === 'true') return true;
+            if (ariaChecked === 'false') return false;
+            const className = String(element.className || '');
+            if (/(^|\s)(checked|selected|is-checked|is-selected|active|on)(\s|$)/i.test(className)) return true;
+            if (/(^|\s)(unchecked|unselected)(\s|$)/i.test(className)) return false;
+            const nestedInput = element.querySelector?.('input[type="radio"], input[type="checkbox"]');
+            if (nestedInput) return Boolean(nestedInput.checked);
+            return null;
+        }
+
+        setChoiceState(element, desired) {
+            if (!element || isDisabled(element)) return false;
+            const targetState = Boolean(desired);
+
+            if (element instanceof HTMLInputElement && /^(radio|checkbox)$/i.test(element.type)) {
+                if (element.checked === targetState) return true;
+
+                try { element.click(); } catch { /* fallback below */ }
+                if (element.checked === targetState) return true;
+
+                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked')?.set;
+                if (setter) setter.call(element, targetState);
+                else element.checked = targetState;
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+                return element.checked === targetState;
+            }
+
+            const before = this.getChoiceState(element);
+            if (before === targetState) return true;
+            if (targetState || before === true) {
+                try { element.click(); } catch { return false; }
+            }
+            const after = this.getChoiceState(element);
+            return after === targetState || (after === null && targetState);
+        }
+
+        getOptionLetterMap(questionNode) {
+            const map = new Map();
+            if (!questionNode) return map;
+
+            const optionElements = this.getOptionElements(questionNode);
+            optionElements.forEach((option, index) => {
+                const text = normalizeText(option.innerText || option.textContent || '');
+                const match = this.normalizeOptionLetter(text).match(/^([A-H])\s*[.、．:：)）]?/);
+                const letter = match?.[1] || (index < 8 ? String.fromCharCode(65 + index) : '');
+                if (!letter || map.has(letter)) return;
+                const target = this.getChoiceTarget(option);
+                if (target) map.set(letter, target);
+            });
+
+            if (!map.size) {
+                const { radios, checkboxes } = this.findAnswerInputs(questionNode);
+                const choices = checkboxes.length ? checkboxes : radios;
+                choices.forEach((choice, index) => {
+                    if (index < 8) map.set(String.fromCharCode(65 + index), choice);
+                });
+            }
+            return map;
+        }
+
+        getJudgementMap(questionNode) {
+            const result = { true: null, false: null };
+            if (!questionNode) return result;
+
+            const options = this.getOptionElements(questionNode);
+            for (const option of options) {
+                const rawText = normalizeText(option.innerText || option.textContent || '');
+                const text = rawText.replace(/^[A-HＡ-Ｈ]\s*[.、．:：)）]?\s*/, '');
+                const target = this.getChoiceTarget(option, 'radio');
+                if (!target) continue;
+                if (/^(对|正确|√|是|T|True|Yes)$/i.test(text)) result.true = target;
+                else if (/^(错|错误|×|否|F|False|No)$/i.test(text)) result.false = target;
+            }
+
+            const { radios } = this.findAnswerInputs(questionNode);
+            if (!result.true && !result.false && radios.length >= 2) {
+                result.true = radios[0];
+                result.false = radios[1];
+            }
+            return result;
+        }
+
+        fillQuestion(questionNode, answer, type) {
+            if (!questionNode || !normalizeText(answer)) return false;
+            const cleanType = normalizeText(type || '');
+
+            if (/判断/.test(cleanType)) return this.fillJudgement(questionNode, answer);
+            if (/多选/.test(cleanType)) return this.fillMultipleChoice(questionNode, answer);
+            if (/单选/.test(cleanType)) return this.fillSingleChoice(questionNode, answer);
+            if (/填空/.test(cleanType)) return this.fillBlank(questionNode, answer);
+            if (/简答|论述|问答/.test(cleanType)) return this.fillEssay(questionNode, answer);
+
+            const { radios, checkboxes, textInputs, textareas, contentEditables } = this.findAnswerInputs(questionNode);
+            if (checkboxes.length) return this.fillMultipleChoice(questionNode, answer);
+            if (radios.length) {
+                if (/^(对|正确|√|错|错误|×|是|否)$/i.test(normalizeText(answer))) {
+                    return this.fillJudgement(questionNode, answer);
+                }
+                return this.fillSingleChoice(questionNode, answer);
+            }
+            if (textInputs.length) return this.fillBlank(questionNode, answer);
+            if (textareas.length || contentEditables.length) return this.fillEssay(questionNode, answer);
+            return false;
+        }
+
+        fillSingleChoice(questionNode, answer) {
+            const letterMap = this.getOptionLetterMap(questionNode);
+            const normalizedAnswer = this.normalizeOptionLetter(answer);
+            const letter = normalizedAnswer.match(/(?:答案\s*[:：]?\s*)?([A-H])/)?.[1];
+            if (letter && letterMap.has(letter)) {
+                return this.setChoiceState(letterMap.get(letter), true);
+            }
+            return this.fillByOptionText(questionNode, answer, 'radio');
+        }
+
+        fillMultipleChoice(questionNode, answer) {
+            const letterMap = this.getOptionLetterMap(questionNode);
+            const normalizedAnswer = this.normalizeOptionLetter(answer);
+            const letters = Array.from(new Set(Array.from(normalizedAnswer.matchAll(/[A-H]/g), match => match[0])));
+            if (!letters.length) return this.fillByOptionText(questionNode, answer, 'checkbox');
+
+            const desired = new Set(letters);
+            for (const [letter, target] of letterMap) {
+                this.setChoiceState(target, desired.has(letter));
+            }
+            return letters.every(letter => letterMap.has(letter) && this.getChoiceState(letterMap.get(letter)) !== false);
+        }
+
+        fillJudgement(questionNode, answer) {
+            const judgementMap = this.getJudgementMap(questionNode);
+            const text = normalizeText(answer).replace(/[。.!！]/g, '');
+            const isTrue = /^(对|正确|√|是|T|True|yes)$/i.test(text);
+            const isFalse = /^(错|错误|×|否|F|False|no)$/i.test(text);
+            if (isTrue && judgementMap.true) return this.setChoiceState(judgementMap.true, true);
+            if (isFalse && judgementMap.false) return this.setChoiceState(judgementMap.false, true);
+            return false;
+        }
+
+        setNativeValue(element, value) {
+            if (!element) return false;
+            if (element.getAttribute?.('contenteditable') === 'true') {
+                element.focus?.();
+                element.textContent = value;
+                element.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    inputType: 'insertText',
+                    data: value,
+                }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+                element.blur?.();
+                return normalizeText(element.textContent) === normalizeText(value);
+            }
+
+            const prototype = element instanceof HTMLTextAreaElement
+                ? HTMLTextAreaElement.prototype
+                : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+            if (setter) setter.call(element, value);
+            else element.value = value;
+            element.dispatchEvent(new Event('input', { bubbles: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+            return String(element.value) === String(value);
+        }
+
+        fillBlank(questionNode, answer) {
+            const { textInputs, textareas, contentEditables } = this.findAnswerInputs(questionNode);
+            const inputs = textInputs.length ? textInputs : (textareas.length ? textareas : contentEditables);
+            if (!inputs.length) return false;
+
+            const parts = String(answer).split(/\|/).map(normalizeText).filter(Boolean);
+            if (!parts.length) return false;
+            let filled = 0;
+            inputs.forEach((input, index) => {
+                const value = parts[index] ?? (inputs.length === 1 ? parts.join('|') : '');
+                if (value && this.setNativeValue(input, value)) filled += 1;
+            });
+            return filled > 0;
+        }
+
+        fillEssay(questionNode, answer) {
+            const { textareas, textInputs, contentEditables } = this.findAnswerInputs(questionNode);
+            const input = textareas[0] || contentEditables[0] || textInputs[0];
+            return input ? this.setNativeValue(input, answer) : false;
+        }
+
+        fillByOptionText(questionNode, answer, inputType = 'radio') {
+            const answerText = normalizeText(answer).toLowerCase();
+            if (!answerText) return false;
+
+            for (const option of this.getOptionElements(questionNode)) {
+                const text = normalizeText(option.innerText || option.textContent || '');
+                const contentOnly = text.replace(/^[A-HＡ-Ｈ]\s*[.、．:：)）]?\s*/, '');
+                if (!contentOnly) continue;
+                const normalizedContent = contentOnly.toLowerCase();
+                if (!answerText.includes(normalizedContent) && !normalizedContent.includes(answerText)) continue;
+                const target = this.getChoiceTarget(option, inputType);
+                if (target && this.setChoiceState(target, true)) return true;
+            }
+            return false;
+        }
     }
 
     class SessionStore {
@@ -964,6 +1472,431 @@
         }
     }
 
+    class AIClient {
+        constructor(settingsStore) {
+            this.settingsStore = settingsStore;
+        }
+
+        getSettings() {
+            return this.settingsStore.load();
+        }
+
+        buildPrompt({ type, question, options }) {
+            const optionsText = options?.length
+                ? options.map((opt, i) => {
+                    const content = normalizeText(opt).replace(/^[A-H\uFF21-\uFF28]\s*[.\u3001\uFF0E:\uFF1A)\uFF09]\s*/, '');
+                    return `  ${String.fromCharCode(65 + i)}. ${content}`;
+                }).join('\n')
+                : '（无选项）';
+
+            let typeInstruction = '';
+            const cleanType = normalizeText(type || '');
+            if (/单选/.test(cleanType)) {
+                typeInstruction = '这是单选题，请从选项中选择唯一正确答案，返回选项字母（如 A）。';
+            } else if (/多选/.test(cleanType)) {
+                typeInstruction = '这是多选题，请选择所有正确答案，返回选项字母用逗号分隔（如 A,C）。';
+            } else if (/判断/.test(cleanType)) {
+                typeInstruction = '这是判断题，请判断对错，返回"对"或"错"。';
+            } else if (/填空/.test(cleanType)) {
+                typeInstruction = '这是填空题，多个空用 | 分隔返回答案（如：答案1|答案2）。';
+            } else if (/简答|论述|问答/.test(cleanType)) {
+                typeInstruction = '这是简答题，请给出简要准确的答案文本。';
+            } else {
+                typeInstruction = '请根据题目内容判断题型并给出正确答案。单选返回字母，多选返回逗号分隔字母，判断返回"对"或"错"，填空用|分隔，简答返回文本。';
+            }
+
+            return `你是一个精准的考试答题助手。请根据题目和选项给出正确答案。
+
+${typeInstruction}
+
+你必须严格按以下 JSON 格式返回，不要输出任何其他内容：
+{"answer": "你的答案", "confidence": 0.95}
+
+confidence 为你对答案正确性的自信程度，范围 0 到 1。
+
+题目：${question}
+
+选项：
+${optionsText}`;
+        }
+
+        async chat(messages, { jsonMode = false } = {}) {
+            const settings = this.getSettings();
+            const apiBase = normalizeText(settings.aiApiBase || 'https://api.deepseek.com/v1');
+            const apiKey = normalizeText(settings.aiApiKey || '');
+            const model = normalizeText(settings.aiModel || 'deepseek-chat');
+
+            if (!apiKey) throw new Error('未配置 AI API Key，请在设置中填写');
+            if (!/^https?:\/\//i.test(apiBase)) throw new Error('AI API 地址格式不正确');
+
+            const normalizedBase = apiBase.replace(/\/+$/, '');
+            const url = /\/chat\/completions$/i.test(normalizedBase)
+                ? normalizedBase
+                : `${normalizedBase}/chat/completions`;
+            const payload = {
+                model,
+                messages,
+                temperature: 0.1,
+                max_tokens: 512,
+            };
+            if (jsonMode) payload.response_format = { type: 'json_object' };
+
+            const describeHttpError = (status, statusText, bodyText = '') => {
+                let detail = '';
+                try {
+                    const parsed = JSON.parse(bodyText || '{}');
+                    detail = normalizeText(parsed?.error?.message || parsed?.message || '');
+                } catch { /* ignore */ }
+                const statusHints = {
+                    400: '请求参数或模型配置不正确',
+                    401: 'API Key 无效或未授权',
+                    402: 'API 账户余额不足',
+                    403: '请求被服务端拒绝',
+                    404: 'API 地址或模型名称不存在',
+                    429: '请求过于频繁，请调大填充间隔',
+                    500: 'AI 服务内部错误',
+                    503: 'AI 服务暂时繁忙',
+                };
+                const hint = detail || statusHints[status] || statusText || '未知错误';
+                return `API 请求失败（${status || '网络错误'}）：${hint}`;
+            };
+
+            const readContent = data => {
+                if (data?.error) throw new Error(data.error.message || `API 错误：${JSON.stringify(data.error)}`);
+                const content = data?.choices?.[0]?.message?.content;
+                if (Array.isArray(content)) {
+                    return content.map(part => part?.text || part?.content || '').join('');
+                }
+                if (typeof content !== 'string' || !content.trim()) {
+                    throw new Error('API 未返回有效答案，请检查模型名称或账户状态');
+                }
+                return content;
+            };
+
+            return new Promise((resolve, reject) => {
+                if (typeof GM_xmlhttpRequest === 'undefined') {
+                    fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${apiKey}`,
+                        },
+                        body: JSON.stringify(payload),
+                    })
+                    .then(async response => {
+                        const text = await response.text();
+                        if (!response.ok) throw new Error(describeHttpError(response.status, response.statusText, text));
+                        try {
+                            return JSON.parse(text);
+                        } catch {
+                            throw new Error(`API 响应不是有效 JSON：${text.slice(0, 160)}`);
+                        }
+                    })
+                    .then(data => resolve(readContent(data)))
+                    .catch(reject);
+                    return;
+                }
+
+                GM_xmlhttpRequest({
+                    method: 'POST',
+                    url,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${apiKey}`,
+                    },
+                    data: JSON.stringify(payload),
+                    onload(response) {
+                        const status = Number(response.status) || 0;
+                        if (status < 200 || status >= 300) {
+                            reject(new Error(describeHttpError(status, response.statusText, response.responseText)));
+                            return;
+                        }
+                        try {
+                            const data = JSON.parse(response.responseText);
+                            resolve(readContent(data));
+                        } catch (error) {
+                            reject(error instanceof Error
+                                ? error
+                                : new Error(`API 响应解析失败：${response.responseText?.slice(0, 160)}`));
+                        }
+                    },
+                    onerror() {
+                        reject(new Error('API 网络请求失败，请检查 API 地址、代理和网络连接'));
+                    },
+                    ontimeout() {
+                        reject(new Error('API 请求超时，请稍后重试或调大答题间隔'));
+                    },
+                    timeout: 30000,
+                });
+            });
+        }
+
+        parseAIResponse(content) {
+            if (!content) return { answer: '', confidence: 0 };
+            const text = String(content)
+                .replace(/^\s*```(?:json)?\s*/i, '')
+                .replace(/\s*```\s*$/i, '')
+                .trim();
+
+            const normalizeAnswer = value => {
+                if (Array.isArray(value)) return value.map(normalizeText).filter(Boolean).join(',');
+                if (value && typeof value === 'object') {
+                    return normalizeText(value.answer ?? value.value ?? value.content ?? '');
+                }
+                return normalizeText(value ?? '');
+            };
+
+            const candidates = [text];
+            const firstBrace = text.indexOf('{');
+            const lastBrace = text.lastIndexOf('}');
+            if (firstBrace >= 0 && lastBrace > firstBrace) {
+                candidates.push(text.slice(firstBrace, lastBrace + 1));
+            }
+
+            for (const candidate of candidates) {
+                try {
+                    const parsed = JSON.parse(candidate);
+                    const answer = normalizeAnswer(parsed?.answer);
+                    if (answer) {
+                        return {
+                            answer,
+                            confidence: Math.max(0, Math.min(1, Number(parsed?.confidence) || 0)),
+                        };
+                    }
+                } catch { /* 尝试后续回退 */ }
+            }
+
+            const answerField = text.match(/["']?answer["']?\s*[:：]\s*["']([^"']+)["']/i);
+            if (answerField?.[1]) {
+                return { answer: normalizeText(answerField[1]), confidence: 0.5 };
+            }
+
+            const lines = text.split('\n').map(normalizeText).filter(Boolean);
+            for (const line of lines) {
+                const cleaned = line
+                    .replace(/^(?:答案|answer)\s*[:：]\s*/i, '')
+                    .replace(/^(["'])|(["'])$/g, '');
+                if (/^[A-HＡ-Ｈ](?:\s*[,，、\s]\s*[A-HＡ-Ｈ])*$/.test(cleaned) || /^[A-HＡ-Ｈ]{1,8}$/.test(cleaned)) {
+                    const answer = cleaned
+                        .replace(/[Ａ-Ｈ]/g, character => String.fromCharCode(character.charCodeAt(0) - 0xFEE0))
+                        .replace(/[，、\s]+/g, ',');
+                    return { answer, confidence: 0.5 };
+                }
+                if (/^(对|错|正确|错误|是|否)$/.test(cleaned)) {
+                    return { answer: cleaned, confidence: 0.5 };
+                }
+            }
+
+            const plain = lines.find(line => !/^[{[]/.test(line));
+            return plain
+                ? { answer: plain.replace(/^(?:答案|answer)\s*[:：]\s*/i, ''), confidence: 0.3 }
+                : { answer: '', confidence: 0 };
+        }
+
+        async answerQuestion({ type, question, options }) {
+            const prompt = this.buildPrompt({ type, question, options });
+            const messages = [
+                { role: 'system', content: '你是一个精准的考试答题助手。请严格按照要求格式返回答案，只输出 JSON，不要输出解释。' },
+                { role: 'user', content: prompt },
+            ];
+
+            const content = await this.chat(messages, { jsonMode: true });
+            return this.parseAIResponse(content);
+        }
+
+        async testConnection() {
+            const settings = this.getSettings();
+            if (!normalizeText(settings.aiApiKey)) throw new Error('未配置 API Key');
+
+            const messages = [
+                { role: 'user', content: '请只回复：连接成功' },
+            ];
+            const content = await this.chat(messages);
+            return Boolean(normalizeText(content));
+        }
+    }
+
+    class AutoFiller {
+        constructor(adapter, store, ui, aiClient, settingsStore) {
+            this.adapter = adapter;
+            this.store = store;
+            this.ui = ui;
+            this.aiClient = aiClient;
+            this.settingsStore = settingsStore;
+            this.busy = false;
+        }
+
+        report(message, tone = 'normal') {
+            this.ui.setStatus(message, tone);
+            this.ui.setAiStatus(message, tone);
+        }
+
+        matchQuestionNode(item, nodes, used = new Set()) {
+            return this.adapter.findQuestionNodeForItem(item, nodes, used);
+        }
+
+        async aiAutoFill() {
+            if (this.busy) {
+                this.report('AI 答题正在进行中', 'active');
+                return;
+            }
+
+            const settings = this.settingsStore.load();
+            if (!normalizeText(settings.aiApiKey)) {
+                this.report('请先在设置中填写 AI API Key，并点击“测试连接”', 'error');
+                return;
+            }
+
+            const targets = this.adapter.getAnswerTargets();
+            if (!targets.length) {
+                const vueCount = this.adapter.getVuePracticeItems().length;
+                this.report(
+                    vueCount
+                        ? `已读取 ${vueCount} 道题，但没有找到页面上的可作答控件；请展开全部题目后重试`
+                        : '当前页面没有识别到可作答题目；请进入作答页并等待题目加载完成',
+                    'error'
+                );
+                return;
+            }
+
+            this.busy = true;
+            let success = 0;
+            let failed = 0;
+            let skipped = 0;
+            let lastError = '';
+
+            try {
+                this.report(`AI 答题开始：共识别 ${targets.length} 题`, 'active');
+
+                for (let index = 0; index < targets.length; index += 1) {
+                    if (!this.busy) break;
+                    const { node, item } = targets[index];
+                    if (!node || !item?.question) {
+                        skipped += 1;
+                        continue;
+                    }
+
+                    this.report(
+                        `AI 答题中：${index + 1} / ${targets.length} — ${item.question.slice(0, 30)}${item.question.length > 30 ? '…' : ''}`,
+                        'active'
+                    );
+
+                    try {
+                        const result = await this.aiClient.answerQuestion({
+                            type: item.type,
+                            question: item.question,
+                            options: item.options,
+                        });
+
+                        if (!normalizeText(result.answer)) {
+                            failed += 1;
+                            lastError = 'AI 未返回可识别答案';
+                            console.warn(`[CXAE] AI答题 第${index + 1}题 未获取到答案`);
+                        } else if (this.adapter.fillQuestion(node, result.answer, item.type)) {
+                            success += 1;
+                            console.log(
+                                `[CXAE] AI答题 第${index + 1}题 成功：${result.answer}（置信度 ${result.confidence}）`
+                            );
+                        } else {
+                            failed += 1;
+                            lastError = `答案“${result.answer}”未能匹配页面控件`;
+                            console.warn(
+                                `[CXAE] AI答题 第${index + 1}题 填充失败：答案=${result.answer}，题型=${item.type}`
+                            );
+                        }
+                    } catch (error) {
+                        failed += 1;
+                        lastError = error?.message || String(error);
+                        console.error(`[CXAE] AI答题 第${index + 1}题 出错：`, error);
+                    }
+
+                    const delay = Math.max(200, Number(settings.autoFillDelay) || 500);
+                    if (index < targets.length - 1 && this.busy) await sleep(delay);
+                }
+
+                if (!this.busy) {
+                    this.report(`AI 答题已停止：成功 ${success} 题，失败 ${failed} 题，跳过 ${skipped} 题`, 'normal');
+                    return;
+                }
+
+                const summary = `AI 答题完成：成功 ${success} 题，失败 ${failed} 题，跳过 ${skipped} 题` +
+                    (lastError ? `；最后错误：${lastError}` : '');
+                this.report(summary, success > 0 ? 'success' : 'error');
+            } catch (error) {
+                this.report(`AI 答题异常：${error.message || '未知错误'}`, 'error');
+            } finally {
+                this.busy = false;
+            }
+        }
+
+        async fillFromCollected() {
+            if (this.busy) {
+                this.report('答题任务正在进行中', 'active');
+                return;
+            }
+
+            const session = this.store.load();
+            const items = (session?.items || []).filter(item => normalizeText(item.answer));
+            if (!items.length) {
+                this.report('没有已采集的正确答案可回填', 'error');
+                return;
+            }
+
+            const nodes = this.adapter.getQuestionNodes();
+            if (!nodes.length) {
+                this.report('当前页面没有识别到可作答题目', 'error');
+                return;
+            }
+
+            this.busy = true;
+            let success = 0;
+            let failed = 0;
+            let skipped = 0;
+            const used = new Set();
+
+            try {
+                this.report(`回填答案开始：${items.length} 个答案待回填`, 'active');
+                const settings = this.settingsStore.load();
+                const delay = Math.max(0, Math.min(1000, Number(settings.autoFillDelay) || 500));
+
+                for (let index = 0; index < items.length; index += 1) {
+                    if (!this.busy) break;
+                    const item = items[index];
+                    const node = this.matchQuestionNode(item, nodes, used);
+                    if (!node) {
+                        skipped += 1;
+                        continue;
+                    }
+                    used.add(node);
+
+                    if (this.adapter.fillQuestion(node, item.answer, item.type)) success += 1;
+                    else failed += 1;
+
+                    if ((index + 1) % 5 === 0) {
+                        this.report(`回填中：${index + 1} / ${items.length}`, 'active');
+                    }
+                    if (delay > 0 && index < items.length - 1) await sleep(delay);
+                }
+
+                const summary = `回填完成：成功 ${success} 题，失败 ${failed} 题，跳过 ${skipped} 题`;
+                this.report(summary, success > 0 ? 'success' : 'error');
+            } catch (error) {
+                this.report(`回填异常：${error.message || '未知错误'}`, 'error');
+            } finally {
+                this.busy = false;
+            }
+        }
+
+        stop() {
+            if (!this.busy) {
+                this.report('当前没有正在运行的答题任务', 'normal');
+                return;
+            }
+            this.busy = false;
+            this.report('正在停止 AI 答题…', 'normal');
+        }
+    }
+
     class AppUI {
         constructor(store, settingsStore) {
             this.store = store;
@@ -1051,6 +1984,18 @@
                 .skipped.visible { display: block; }
                 .skipped-item { margin-top: 5px; color: #64748b; font-size: 11px; line-height: 1.45; }
                 .footer { color: #94a3b8; text-align: center; font-size: 11px; padding: 1px 0 3px; }
+                .input-field { width: 100%; border: 1px solid #cbd5e1; border-radius: 8px; padding: 7px 10px; font-size: 13px; color: #0f172a; background: #fff; outline: none; transition: border-color .15s; }
+                .input-field:focus { border-color: #2563eb; }
+                .input-field::placeholder { color: #94a3b8; }
+                .input-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+                .input-row .input-field { flex: 1; }
+                .input-label { display: block; margin-bottom: 4px; color: #334155; font-size: 12px; font-weight: 600; }
+                .btn-sm { border: 1px solid #cbd5e1; border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer; color: #0f172a; background: #fff; font-weight: 600; white-space: nowrap; }
+                .btn-sm:hover { border-color: #94a3b8; background: #f8fafc; }
+                .ai-status { margin-top: 6px; color: #475569; font-size: 11px; line-height: 1.4; }
+                .ai-status[data-tone="success"] { color: #047857; }
+                .ai-status[data-tone="error"] { color: #b91c1c; }
+                .ai-status[data-tone="active"] { color: #1d4ed8; }
                 @media (max-width: 520px) {
                     .launcher { right: 12px; bottom: 12px; }
                     .panel { right: 12px; bottom: 76px; width: calc(100vw - 24px); max-height: calc(100vh - 92px); }
@@ -1069,6 +2014,12 @@
                     .button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
                     .progress { background: #334155; }
                     .skipped { border-color: #475569; }
+                    .input-field { color: #e2e8f0; background: #0f172a; border-color: #475569; }
+                    .input-field:focus { border-color: #2563eb; }
+                    .input-label { color: #cbd5e1; }
+                    .btn-sm { color: #e2e8f0; background: #0f172a; border-color: #475569; }
+                    .btn-sm:hover { background: #1e293b; border-color: #64748b; }
+                    .ai-status { color: #94a3b8; }
                 }
             `;
 
@@ -1123,10 +2074,44 @@
                         </section>
 
                         <section class="card">
+                            <h3 class="section-title">AI 答题</h3>
+                            <div class="grid">
+                                <button class="button primary full" type="button" data-action="ai-fill">AI 自动答题</button>
+                                <button class="button" type="button" data-action="fill-collected">回填已采集答案</button>
+                                <button class="button" type="button" data-action="stop-fill">停止答题</button>
+                            </div>
+                            <div class="ai-status" data-role="ai-status">点击"AI 自动答题"将调用 AI 生成答案并自动填充</div>
+                        </section>
+
+                        <section class="card">
                             <h3 class="section-title">设置</h3>
                             <div class="settings">
-                                <label class="setting"><span>未作答题自动点击“显示答案”</span><span class="switch"><input type="checkbox" data-setting="autoRevealAnswer"><span></span></span></label>
+                                <label class="setting"><span>未作答题自动点击"显示答案"</span><span class="switch"><input type="checkbox" data-setting="autoRevealAnswer"><span></span></span></label>
                                 <label class="setting"><span>导出文件名添加时间</span><span class="switch"><input type="checkbox" data-setting="includeTimestamp"><span></span></span></label>
+                            </div>
+                            <div style="margin-top: 12px; padding-top: 10px; border-top: 1px dashed #cbd5e1;">
+                                <div style="color: #334155; font-size: 12px; font-weight: 760; margin-bottom: 8px;">AI 配置</div>
+                                <div style="margin-bottom: 8px;">
+                                    <label class="input-label">API Key</label>
+                                    <input class="input-field" type="password" data-setting="aiApiKey" placeholder="输入你的 DeepSeek API Key">
+                                </div>
+                                <div class="input-row">
+                                    <div style="flex: 1;">
+                                        <label class="input-label">API 地址</label>
+                                        <input class="input-field" type="text" data-setting="aiApiBase" placeholder="https://api.deepseek.com/v1">
+                                    </div>
+                                </div>
+                                <div class="input-row">
+                                    <div style="flex: 1;">
+                                        <label class="input-label">模型</label>
+                                        <input class="input-field" type="text" data-setting="aiModel" placeholder="deepseek-chat">
+                                    </div>
+                                    <button class="btn-sm" type="button" data-action="test-ai">测试连接</button>
+                                </div>
+                                <div style="margin-top: 4px;">
+                                    <label class="input-label">填充间隔（毫秒）</label>
+                                    <input class="input-field" type="number" data-setting="autoFillDelay" placeholder="500" min="200" max="5000" style="width: 120px;">
+                                </div>
                             </div>
                         </section>
 
@@ -1158,12 +2143,31 @@
             });
 
             this.shadow.querySelectorAll('[data-setting]').forEach(input => {
-                input.addEventListener('change', () => {
+                const eventType = (input.type === 'text' || input.type === 'password' || input.type === 'number') ? 'change' : 'change';
+                input.addEventListener(eventType, () => {
                     const settings = this.settingsStore.load();
-                    settings[input.dataset.setting] = input.checked;
+                    if (input.type === 'checkbox') {
+                        settings[input.dataset.setting] = input.checked;
+                    } else if (input.type === 'number') {
+                        settings[input.dataset.setting] = Number(input.value) || undefined;
+                    } else {
+                        settings[input.dataset.setting] = input.value;
+                    }
                     this.settingsStore.save(settings);
                     this.handlers.settings?.(settings);
                 });
+                // 文本输入也监听 blur，确保值保存
+                if (input.type === 'text' || input.type === 'password' || input.type === 'number') {
+                    input.addEventListener('blur', () => {
+                        const settings = this.settingsStore.load();
+                        if (input.type === 'number') {
+                            settings[input.dataset.setting] = Number(input.value) || undefined;
+                        } else {
+                            settings[input.dataset.setting] = input.value;
+                        }
+                        this.settingsStore.save(settings);
+                    });
+                }
             });
         }
 
@@ -1174,7 +2178,15 @@
         applySettings() {
             const settings = this.settingsStore.load();
             this.shadow.querySelectorAll('[data-setting]').forEach(input => {
-                input.checked = Boolean(settings[input.dataset.setting]);
+                const key = input.dataset.setting;
+                const value = settings[key];
+                if (input.type === 'checkbox') {
+                    input.checked = Boolean(value);
+                } else {
+                    if (value !== undefined && value !== '') {
+                        input.value = value;
+                    }
+                }
             });
         }
 
@@ -1200,6 +2212,14 @@
             element.dataset.tone = tone;
             this.logs.unshift({ message, tone, at: Date.now() });
             this.logs = this.logs.slice(0, 10);
+        }
+
+        setAiStatus(message, tone = 'normal') {
+            const element = this.$('[data-role="ai-status"]');
+            if (element) {
+                element.textContent = message;
+                element.dataset.tone = tone;
+            }
         }
 
         refresh() {
@@ -1233,7 +2253,7 @@
             startButton.disabled = Boolean(session?.active);
             startButton.textContent = session?.items?.length || session?.skipped?.length ? '继续采集' : '开始采集';
             pauseButton.disabled = !session?.active;
-            exportButtons.forEach(button => { button.disabled = stats.answerCount === 0; });
+            exportButtons.filter(Boolean).forEach(button => { button.disabled = stats.answerCount === 0; });
 
             const skippedList = this.$('[data-role="skipped-list"]');
             const recent = (session?.skipped || []).slice(-4).reverse();
@@ -1533,20 +2553,24 @@
 
         navigationGuard(session, action) {
             const now = Date.now();
-            if (session.lastAction === action && now - Number(session.lastActionAt || 0) < 30000) {
+            const currentOrder = this.adapter.getCurrentOrder();
+            // 基于题号是否变化来判断：如果 action 相同且题号也没变，才增加失败计数
+            const orderUnchanged = currentOrder > 0 && Number(session.lastGuardedOrder) === currentOrder;
+            if (session.lastAction === action && now - Number(session.lastActionAt || 0) < 30000 && orderUnchanged) {
                 session.jumpAttempts[action] = Number(session.jumpAttempts[action] || 0) + 1;
             } else {
                 session.jumpAttempts[action] = 1;
             }
             session.lastAction = action;
             session.lastActionAt = now;
+            session.lastGuardedOrder = currentOrder;
             return session.jumpAttempts[action] <= APP.maxJumpAttempts;
         }
 
         navigate(element, session, action) {
             if (!element) return false;
             if (!this.navigationGuard(session, action)) {
-                this.finish(session, 'error', `连续执行“${action}”仍未成功，已停止以避免循环刷新`);
+                this.finish(session, 'error', `连续执行"${action}"仍未成功，已停止以避免循环刷新`);
                 return false;
             }
             if (!this.store.save(session)) {
@@ -1591,18 +2615,18 @@
                 session.phase = 'resuming';
                 session.targetOrder = target;
                 this.ui.setStatus(`正在从第 ${current} 题跳转到第 ${target} 题…`, 'active');
-                return this.navigate(direct, session, `跳转第${target}题`);
+                return this.navigate(direct, session, `跳转第${current}到第${target}题`);
             }
 
             const label = current < target ? '下一题' : '上一题';
             const button = this.adapter.findNavigation(label);
             if (!button) {
-                this.finish(session, 'error', `无法找到“${label}”按钮以恢复到第 ${target} 题`);
+                this.finish(session, 'error', `无法找到"${label}"按钮以恢复到第 ${target} 题`);
                 return false;
             }
             session.phase = 'resuming';
             session.targetOrder = target;
-            return this.navigate(button, session, `恢复-${label}-${target}`);
+            return this.navigate(button, session, `恢复-${current}-${label}-${target}`);
         }
 
         async resume() {
@@ -1659,8 +2683,8 @@
                         session.revealAttempts[item.order] = attempts + 1;
                         session.phase = 'revealing';
                         session.pendingAnswerOrder = item.order;
-                        this.ui.setStatus(`第 ${item.order} 题未显示答案，正在点击“显示答案”…`, 'active');
-                        this.navigate(reveal, session, `显示答案-${item.order}`);
+                        this.ui.setStatus(`第 ${item.order} 题未显示答案，正在点击"显示答案"…`, 'active');
+                        this.navigate(reveal, session, `reveal-answer-${item.order}`);
                         return;
                     }
                 }
@@ -1699,7 +2723,7 @@
                     this.finish(session, 'completed');
                     return;
                 }
-                this.navigate(next, session, `下一题-${item.order + 1}`);
+                this.navigate(next, session, `next-from${item.order}-to${item.order + 1}`);
             } catch (error) {
                 session = this.store.load() || session;
                 this.finish(session, 'error', error.message || '跨页面采集失败');
@@ -1721,6 +2745,8 @@
     const settingsStore = new SettingsStore();
     const store = new SessionStore(adapter);
     const ui = new AppUI(store, settingsStore);
+    const aiClient = new AIClient(settingsStore);
+    const autoFiller = new AutoFiller(adapter, store, ui, aiClient, settingsStore);
     const collector = new Collector(adapter, store, settingsStore, ui);
     const exporter = new Exporter(store, settingsStore);
 
@@ -1730,6 +2756,32 @@
             ui.setStatus('导出任务已创建', 'success');
         } catch (error) {
             ui.setStatus(error.message || '导出失败', 'error');
+        }
+    }
+
+    async function handleAiFill() {
+        try {
+            await autoFiller.aiAutoFill();
+        } catch (error) {
+            ui.setAiStatus(`AI 答题失败：${error.message || '未知错误'}`, 'error');
+        }
+    }
+
+    async function handleFillCollected() {
+        try {
+            await autoFiller.fillFromCollected();
+        } catch (error) {
+            ui.setAiStatus(`回填失败：${error.message || '未知错误'}`, 'error');
+        }
+    }
+
+    async function handleTestAi() {
+        ui.setAiStatus('正在测试 AI 连接…', 'active');
+        try {
+            await aiClient.testConnection();
+            ui.setAiStatus('AI 连接测试成功！', 'success');
+        } catch (error) {
+            ui.setAiStatus(`连接失败：${error.message || '未知错误'}`, 'error');
         }
     }
 
@@ -1743,6 +2795,10 @@
         ui.on('excel', () => handleExport('exportExcel'));
         ui.on('markdown', () => handleExport('exportMarkdown'));
         ui.on('json', () => handleExport('exportJson'));
+        ui.on('ai-fill', () => handleAiFill());
+        ui.on('fill-collected', () => handleFillCollected());
+        ui.on('stop-fill', () => autoFiller.stop());
+        ui.on('test-ai', () => handleTestAi());
         ui.on('settings', () => ui.refresh());
         collector.autoResume();
         return true;
