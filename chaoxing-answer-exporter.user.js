@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答案导出器
 // @namespace    https://github.com/zenghaolinz/chaoxing-answer-exporter
-// @version      1.2.2
+// @version      1.2.3
 // @description  采集超星学习通题目与正确答案，支持逐题换页、长卷同页、随堂练习、AI自动答题、显示答案跳转和断点恢复
 // @author       zenghaolinz
 // @license      MIT
@@ -24,14 +24,16 @@
     const APP = Object.freeze({
         id: 'cx-answer-exporter',
         name: '超星答案导出器',
-        version: '1.2.2',
+        version: '1.2.3',
         storageVersion: 1,
         sessionPrefix: 'CXAE_SESSION_',
         settingsKey: 'CXAE_SETTINGS',
+        aiTaskPrefix: 'CXAE_AI_TASK_',
         maxRevealAttempts: 3,
         maxJumpAttempts: 2,
         navigationDelay: 650,
         questionWaitTimeout: 15000,
+        aiNavigationTimeout: 12000,
     });
 
     const DEFAULT_SETTINGS = Object.freeze({
@@ -643,6 +645,46 @@
             })).filter(target => target.item);
         }
 
+        isQuestionNodeVisible(node) {
+            if (!node) return false;
+            if (isVisible(node)) return true;
+            const controls = node.querySelectorAll?.(
+                'input, textarea, [contenteditable="true"], [role="radio"], [role="checkbox"], button, a'
+            ) || [];
+            return Array.from(controls).some(isVisible);
+        }
+
+        getVisibleAnswerTargets() {
+            const targets = this.getAnswerTargets();
+            const visible = targets.filter(target => this.isQuestionNodeVisible(target.node));
+            if (visible.length) return visible;
+            return targets.length === 1 ? targets : [];
+        }
+
+        getCurrentAnswerTarget() {
+            const targets = this.getVisibleAnswerTargets();
+            if (!targets.length) return null;
+            const currentOrder = this.getCurrentOrder();
+            const target = targets.find(candidate => Number(candidate.item?.order) === currentOrder) || targets[0];
+            if (!target?.item) return null;
+            return {
+                node: target.node,
+                item: {
+                    ...target.item,
+                    order: Number(target.item.order) || currentOrder || 0,
+                },
+            };
+        }
+
+        getQuestionSignature() {
+            const target = this.getVisibleAnswerTargets()[0];
+            const order = this.getCurrentOrder();
+            if (!target?.item) return order ? `order:${order}` : '';
+            const question = normalizeText(target.item.question || '').slice(0, 180);
+            const options = (target.item.options || []).map(normalizeText).join('|').slice(0, 220);
+            return `${order}|${question}|${options}`;
+        }
+
         getLines(question) {
             return String(question?.innerText || question?.textContent || '')
                 .split('\n')
@@ -844,11 +886,8 @@
                 }
             }
 
-            const navNumbers = Array.from(document.querySelectorAll('a, button, [onclick], [role="button"]'))
-                .map(element => normalizeText(element.textContent))
-                .filter(textValue => /^\d{1,5}$/.test(textValue))
-                .map(Number);
-            if (navNumbers.length >= 5) values.push(Math.max(...navNumbers));
+            const navNumbers = this.getQuestionNavigationNumbers();
+            if (navNumbers.length >= 3) values.push(Math.max(...navNumbers));
 
             const practiceCount = this.getVuePracticeContext()?.list?.length || 0;
             if (practiceCount) values.push(practiceCount);
@@ -885,7 +924,8 @@
         }
 
         getCurrentOrder() {
-            const question = this.getQuestionNodes()[0];
+            const nodes = this.getQuestionNodes();
+            const question = nodes.find(node => this.isQuestionNodeVisible(node)) || nodes[0];
             const parsed = question ? this.parseQuestion(question) : null;
             return Number(parsed?.order) || this.getActiveQuestionNumber() || 0;
         }
@@ -924,36 +964,83 @@
         }
 
         findNavigation(label) {
-            return Array.from(document.querySelectorAll('a, button, input, [role="button"]'))
-                .find(element => {
-                    const text = element.tagName === 'INPUT'
-                        ? normalizeText(element.value)
-                        : normalizeText(element.innerText || element.textContent);
-                    return text === label && isVisible(element) && !isDisabled(element);
-                }) || null;
+            return this.findTextAction(label) || null;
+        }
+
+        getQuestionNumberCandidates(number = null) {
+            const targetText = number == null ? null : String(number);
+            const selector = [
+                'a', 'button', 'input[type="button"]', 'input[type="submit"]',
+                '[role="button"]', '[onclick]', 'li',
+                '[data-question-index]', '[data-question-number]', '[data-index]', '[data-num]',
+                '[class*="question-num"]', '[class*="questionNum"]',
+                '[class*="topic-num"]', '[class*="topicNum"]',
+                '[class*="answer-card"]', '[class*="answerCard"]',
+                '[class*="subject-num"]', '[class*="subjectNum"]',
+                '[class*="number"]', '[class*="Number"]'
+            ].join(',');
+            const result = [];
+            const seen = new Set();
+
+            for (const node of document.querySelectorAll(selector)) {
+                if (node.closest?.(`#${APP.id}-host`) || !isVisible(node)) continue;
+                const text = node.tagName === 'INPUT'
+                    ? normalizeText(node.value)
+                    : normalizeText(node.innerText || node.textContent);
+                if (!/^\d{1,5}$/.test(text) || (targetText !== null && text !== targetText)) continue;
+
+                let element = node;
+                const standardClickable = node.matches?.('a, button, input, [role="button"], [onclick]')
+                    ? node
+                    : node.closest?.('a, button, input, [role="button"], [onclick]');
+                if (standardClickable && normalizeText(
+                    standardClickable.tagName === 'INPUT' ? standardClickable.value : standardClickable.innerText || standardClickable.textContent
+                ) === text) {
+                    element = standardClickable;
+                }
+                if (seen.has(element) || isDisabled(element)) continue;
+                seen.add(element);
+
+                const className = String(element.className || '');
+                const onclick = String(element.getAttribute?.('onclick') || '');
+                const style = getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                let score = 0;
+                if (element.matches?.('a, button, input, [role="button"], [onclick]')) score += 4;
+                if (style.cursor === 'pointer') score += 2;
+                if (/question|answer|topic|subject|num|number|index|card|catalog|nav/i.test(className)) score += 4;
+                if (/getThe|question|exam|test|topic|subject|change/i.test(onclick)) score += 4;
+                if (rect.width <= 140 && rect.height <= 100) score += 1;
+
+                let ancestor = element.parentElement;
+                for (let depth = 0; ancestor && depth < 5; depth += 1, ancestor = ancestor.parentElement) {
+                    if (ancestor.closest?.(`#${APP.id}-host`)) break;
+                    const lines = String(ancestor.innerText || ancestor.textContent || '')
+                        .split('\n').map(normalizeText).filter(value => /^\d{1,5}$/.test(value));
+                    const uniqueCount = new Set(lines).size;
+                    const ancestorClass = String(ancestor.className || '');
+                    if (uniqueCount >= 3) score += uniqueCount >= 8 ? 6 : 4;
+                    if (/answer|question|topic|subject|card|catalog|nav|number|num/i.test(ancestorClass)) score += 2;
+                    if (uniqueCount >= 3) break;
+                }
+
+                result.push({ element, number: Number(text), score });
+            }
+
+            return result.sort((left, right) => right.score - left.score);
+        }
+
+        getQuestionNavigationNumbers() {
+            const candidates = this.getQuestionNumberCandidates()
+                .filter(candidate => candidate.score >= 5)
+                .map(candidate => candidate.number)
+                .filter(value => Number.isFinite(value) && value > 0);
+            return Array.from(new Set(candidates)).sort((left, right) => left - right);
         }
 
         findNumberButton(number) {
-            const target = String(number);
-            const candidates = Array.from(document.querySelectorAll('a, button, [onclick], [role="button"]'))
-                .filter(element => normalizeText(element.textContent) === target)
-                .filter(isVisible)
-                .map(element => {
-                    let score = 0;
-                    const onclick = String(element.getAttribute('onclick') || '');
-                    const className = String(element.className || '');
-                    if (/getThe|question|exam|test/i.test(onclick)) score += 4;
-                    if (/question|answer|num|topic|subject|jb_/i.test(className)) score += 2;
-                    const numericSiblings = element.parentElement
-                        ? Array.from(element.parentElement.children)
-                            .filter(child => /^\d+$/.test(normalizeText(child.textContent))).length
-                        : 0;
-                    if (numericSiblings >= 5) score += 3;
-                    return { element, score };
-                })
-                .sort((left, right) => right.score - left.score);
-
-            return candidates.length && candidates[0].score >= 2 ? candidates[0].element : null;
+            const candidates = this.getQuestionNumberCandidates(number);
+            return candidates.length && candidates[0].score >= 5 ? candidates[0].element : null;
         }
 
         isSafeInlineReveal(button) {
@@ -992,6 +1079,31 @@
                 await sleep(250);
             }
             return last;
+        }
+
+        async waitForQuestionSwitch(previousSignature = '', targetOrder = 0, timeout = APP.aiNavigationTimeout) {
+            const startedAt = Date.now();
+            let lastSignature = '';
+            let stableHits = 0;
+
+            while (Date.now() - startedAt < timeout) {
+                const currentOrder = this.getCurrentOrder();
+                const signature = this.getQuestionSignature();
+                const orderMatched = Number(targetOrder) > 0 && currentOrder === Number(targetOrder);
+                const contentChanged = Boolean(signature && previousSignature && signature !== previousSignature);
+                const ready = orderMatched || contentChanged || (!previousSignature && Boolean(signature));
+
+                if (ready) {
+                    if (signature && signature === lastSignature) stableHits += 1;
+                    else {
+                        lastSignature = signature;
+                        stableHits = 1;
+                    }
+                    if (stableHits >= 2) return true;
+                }
+                await sleep(220);
+            }
+            return false;
         }
 
         getPaperTitle() {
@@ -1831,11 +1943,102 @@ ${optionsText}`;
             this.aiClient = aiClient;
             this.settingsStore = settingsStore;
             this.busy = false;
+            this.resumeTimer = null;
+        }
+
+        get taskKey() {
+            return `${APP.aiTaskPrefix}${simpleHash(this.adapter.getScope())}`;
         }
 
         report(message, tone = 'normal') {
             this.ui.setStatus(message, tone);
             this.ui.setAiStatus(message, tone);
+        }
+
+        loadTask() {
+            try {
+                const raw = localStorage.getItem(this.taskKey);
+                if (!raw) return null;
+                const task = JSON.parse(raw);
+                if (!task || task.version !== 1) return null;
+                task.processedOrders = Array.isArray(task.processedOrders) ? task.processedOrders : [];
+                task.success = Number(task.success) || 0;
+                task.failed = Number(task.failed) || 0;
+                task.skipped = Number(task.skipped) || 0;
+                return task;
+            } catch (error) {
+                console.warn('[CXAE] 读取 AI 自动翻页进度失败。', error);
+                return null;
+            }
+        }
+
+        saveTask(task) {
+            if (!task) return false;
+            task.version = 1;
+            task.scope = this.adapter.getScope();
+            task.updatedAt = Date.now();
+            try {
+                localStorage.setItem(this.taskKey, JSON.stringify(task));
+                return true;
+            } catch (error) {
+                console.error('[CXAE] 保存 AI 自动翻页进度失败。', error);
+                return false;
+            }
+        }
+
+        clearTask() {
+            localStorage.removeItem(this.taskKey);
+        }
+
+        createPagedTask(total) {
+            return {
+                version: 1,
+                scope: this.adapter.getScope(),
+                active: true,
+                phase: 'starting',
+                total: Number(total) || 0,
+                nextOrder: 1,
+                targetOrder: 1,
+                processedOrders: [],
+                success: 0,
+                failed: 0,
+                skipped: 0,
+                lastError: '',
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+            };
+        }
+
+        firstPendingOrder(task) {
+            const processed = new Set((task?.processedOrders || []).map(Number));
+            const total = Number(task?.total) || 0;
+            for (let order = 1; order <= total; order += 1) {
+                if (!processed.has(order)) return order;
+            }
+            return total + 1;
+        }
+
+        markTaskProcessed(task, order) {
+            const value = Number(order);
+            if (value > 0) {
+                task.processedOrders = Array.from(new Set([...(task.processedOrders || []), value]))
+                    .sort((left, right) => left - right);
+            }
+            task.nextOrder = this.firstPendingOrder(task);
+        }
+
+        getPagedInfo() {
+            const navigationNumbers = this.adapter.getQuestionNavigationNumbers();
+            const visibleTargets = this.adapter.getVisibleAnswerTargets();
+            const detectedTotal = this.adapter.detectTotal();
+            const navigationTotal = navigationNumbers.length ? Math.max(...navigationNumbers) : 0;
+            const total = Math.max(detectedTotal, navigationTotal);
+            const hasDirectionalNavigation = Boolean(
+                this.adapter.findNavigation('下一题') || this.adapter.findNavigation('上一题')
+            );
+            const paged = total > 1 && visibleTargets.length <= 1 &&
+                (navigationNumbers.length >= 2 || hasDirectionalNavigation);
+            return { paged, total, navigationNumbers, visibleTargets };
         }
 
         matchQuestionNode(item, nodes, used = new Set()) {
@@ -1854,6 +2057,29 @@ ${optionsText}`;
                 return;
             }
 
+            const existingTask = this.loadTask();
+            if (existingTask?.active && this.firstPendingOrder(existingTask) <= Number(existingTask.total)) {
+                this.report(`继续 AI 自动翻页：第 ${this.firstPendingOrder(existingTask)} / ${existingTask.total} 题`, 'active');
+                await this.runPagedTask();
+                return;
+            }
+
+            const pageInfo = this.getPagedInfo();
+            if (pageInfo.paged) {
+                let task = existingTask;
+                if (!task || task.phase === 'completed' || Number(task.total) !== Number(pageInfo.total)) {
+                    task = this.createPagedTask(pageInfo.total);
+                } else {
+                    task.active = true;
+                    task.phase = 'resuming';
+                    task.total = Math.max(Number(task.total) || 0, pageInfo.total);
+                    task.nextOrder = this.firstPendingOrder(task);
+                }
+                this.saveTask(task);
+                await this.runPagedTask();
+                return;
+            }
+
             const targets = this.adapter.getAnswerTargets();
             if (!targets.length) {
                 const vueCount = this.adapter.getVuePracticeItems().length;
@@ -1866,11 +2092,16 @@ ${optionsText}`;
                 return;
             }
 
+            await this.runInlineTargets(targets);
+        }
+
+        async runInlineTargets(targets) {
             this.busy = true;
             let success = 0;
             let failed = 0;
             let skipped = 0;
             let lastError = '';
+            const settings = this.settingsStore.load();
 
             try {
                 this.report(`AI 答题开始：共识别 ${targets.length} 题`, 'active');
@@ -1901,6 +2132,7 @@ ${optionsText}`;
                             console.warn(`[CXAE] AI答题 第${index + 1}题 未获取到答案`);
                         } else if (this.adapter.fillQuestion(node, result.answer, item.type)) {
                             success += 1;
+                            this.recordGeneratedAnswer(item, result, Number(item.order) || index + 1, targets.length);
                             console.log(
                                 `[CXAE] AI答题 第${index + 1}题 成功：${result.answer}（置信度 ${result.confidence}）`
                             );
@@ -1929,8 +2161,206 @@ ${optionsText}`;
                 const summary = `AI 答题完成：成功 ${success} 题，失败 ${failed} 题，跳过 ${skipped} 题` +
                     (lastError ? `；最后错误：${lastError}` : '');
                 this.report(summary, success > 0 ? 'success' : 'error');
+                this.ui.refresh();
             } catch (error) {
                 this.report(`AI 答题异常：${error.message || '未知错误'}`, 'error');
+            } finally {
+                this.busy = false;
+            }
+        }
+
+        async ensurePagedQuestion(order, task) {
+            const targetOrder = Number(order);
+            const currentOrder = this.adapter.getCurrentOrder();
+            if (currentOrder === targetOrder) return true;
+
+            const previousSignature = this.adapter.getQuestionSignature();
+            let navigation = this.adapter.findNumberButton(targetOrder);
+            if (!navigation && currentOrder > 0) {
+                if (targetOrder === currentOrder + 1) navigation = this.adapter.findNavigation('下一题');
+                else if (targetOrder === currentOrder - 1) navigation = this.adapter.findNavigation('上一题');
+            }
+            if (!navigation) {
+                task.lastError = `找不到第 ${targetOrder} 题的题号按钮或翻页按钮`;
+                this.saveTask(task);
+                return false;
+            }
+
+            task.phase = 'navigating';
+            task.targetOrder = targetOrder;
+            this.saveTask(task);
+
+            try {
+                navigation.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+                navigation.click();
+            } catch (error) {
+                const href = navigation.href || navigation.getAttribute?.('href');
+                if (href && !/^javascript:/i.test(href)) {
+                    location.assign(href);
+                    return false;
+                }
+                task.lastError = `点击第 ${targetOrder} 题失败：${error?.message || error}`;
+                this.saveTask(task);
+                return false;
+            }
+
+            const switched = await this.adapter.waitForQuestionSwitch(
+                previousSignature,
+                targetOrder,
+                APP.aiNavigationTimeout
+            );
+            if (switched) return true;
+
+            const latestOrder = this.adapter.getCurrentOrder();
+            const latestSignature = this.adapter.getQuestionSignature();
+            return latestOrder === targetOrder || Boolean(latestSignature && latestSignature !== previousSignature);
+        }
+
+        async waitForCurrentTarget(order, timeout = APP.questionWaitTimeout) {
+            const startedAt = Date.now();
+            while (Date.now() - startedAt < timeout) {
+                const target = this.adapter.getCurrentAnswerTarget();
+                if (target?.node && target?.item?.question) return target;
+                await sleep(220);
+            }
+            return null;
+        }
+
+        recordGeneratedAnswer(item, result, order, total = 0) {
+            try {
+                let session = this.store.load() || this.store.create('ai-paged');
+                const wasActive = Boolean(session.active);
+                const previousPhase = session.phase;
+                session.mode = session.mode === 'practice-vue' || session.mode === 'long-page'
+                    ? session.mode
+                    : 'ai-paged';
+                session.total = Math.max(Number(session.total) || 0, Number(total) || 0, Number(order) || 0);
+                this.store.addItem(session, {
+                    ...item,
+                    order: Number(order) || Number(item.order) || 0,
+                    answer: normalizeText(result.answer),
+                    source: 'ai-generated',
+                    confidence: Number(result.confidence) || 0,
+                    sourceUrl: location.href,
+                });
+                session.active = wasActive;
+                session.phase = wasActive ? previousPhase : 'paused';
+                session.message = wasActive ? session.message : 'AI 自动答题已生成并回填答案';
+                this.store.save(session);
+            } catch (error) {
+                console.warn('[CXAE] 保存 AI 生成答案失败。', error);
+            }
+        }
+
+        async runPagedTask() {
+            if (this.busy) return;
+            let task = this.loadTask();
+            if (!task?.active) return;
+
+            this.busy = true;
+            try {
+                while (this.busy) {
+                    task = this.loadTask() || task;
+                    if (!task.active) break;
+
+                    const order = this.firstPendingOrder(task);
+                    if (order > Number(task.total)) {
+                        task.active = false;
+                        task.phase = 'completed';
+                        task.nextOrder = order;
+                        this.saveTask(task);
+                        const summary = `AI 自动翻页完成：成功 ${task.success} 题，失败 ${task.failed} 题，跳过 ${task.skipped} 题` +
+                            (task.lastError ? `；最后错误：${task.lastError}` : '');
+                        this.report(summary, task.success > 0 ? 'success' : 'error');
+                        this.ui.refresh();
+                        return;
+                    }
+
+                    task.nextOrder = order;
+                    task.targetOrder = order;
+                    task.phase = 'positioning';
+                    this.saveTask(task);
+                    this.report(
+                        `AI 自动翻页：第 ${order} / ${task.total} 题（成功 ${task.success}，失败 ${task.failed}）`,
+                        'active'
+                    );
+
+                    const positioned = await this.ensurePagedQuestion(order, task);
+                    if (!this.busy) break;
+                    if (!positioned) {
+                        task = this.loadTask() || task;
+                        task.active = false;
+                        task.phase = 'paused';
+                        task.lastError ||= `无法切换到第 ${order} 题`;
+                        this.saveTask(task);
+                        this.report(`AI 自动翻页已暂停：${task.lastError}`, 'error');
+                        return;
+                    }
+
+                    const target = await this.waitForCurrentTarget(order);
+                    if (!this.busy) break;
+                    if (!target?.node || !target?.item?.question) {
+                        task = this.loadTask() || task;
+                        task.skipped += 1;
+                        task.lastError = `第 ${order} 题页面加载后未识别到题目或作答控件`;
+                        this.markTaskProcessed(task, order);
+                        this.saveTask(task);
+                        continue;
+                    }
+
+                    const item = { ...target.item, order };
+                    try {
+                        const result = await this.aiClient.answerQuestion({
+                            type: item.type,
+                            question: item.question,
+                            options: item.options,
+                        });
+                        if (!normalizeText(result.answer)) {
+                            task.failed += 1;
+                            task.lastError = `第 ${order} 题：AI 未返回可识别答案`;
+                            console.warn(`[CXAE] AI自动翻页 第${order}题 未获取到答案`);
+                        } else if (this.adapter.fillQuestion(target.node, result.answer, item.type)) {
+                            task.success += 1;
+                            task.lastError = '';
+                            this.recordGeneratedAnswer(item, result, order, task.total);
+                            console.log(
+                                `[CXAE] AI自动翻页 第${order}题 成功：${result.answer}（置信度 ${result.confidence}）`
+                            );
+                        } else {
+                            task.failed += 1;
+                            task.lastError = `第 ${order} 题：答案“${result.answer}”未能匹配页面控件`;
+                            console.warn(
+                                `[CXAE] AI自动翻页 第${order}题 填充失败：答案=${result.answer}，题型=${item.type}`
+                            );
+                        }
+                    } catch (error) {
+                        task.failed += 1;
+                        task.lastError = `第 ${order} 题：${error?.message || String(error)}`;
+                        console.error(`[CXAE] AI自动翻页 第${order}题 出错：`, error);
+                    }
+
+                    this.markTaskProcessed(task, order);
+                    task.phase = 'answered';
+                    this.saveTask(task);
+                    this.ui.refresh();
+
+                    const settings = this.settingsStore.load();
+                    const delay = Math.max(300, Number(settings.autoFillDelay) || 500);
+                    if (this.firstPendingOrder(task) <= Number(task.total) && this.busy) await sleep(delay);
+                }
+
+                task = this.loadTask() || task;
+                if (!this.busy || !task.active) {
+                    const summary = `AI 自动翻页已停止：成功 ${task.success} 题，失败 ${task.failed} 题，跳过 ${task.skipped} 题`;
+                    this.report(summary, 'normal');
+                }
+            } catch (error) {
+                task = this.loadTask() || task;
+                task.active = false;
+                task.phase = 'error';
+                task.lastError = error?.message || String(error);
+                this.saveTask(task);
+                this.report(`AI 自动翻页异常：${task.lastError}`, 'error');
             } finally {
                 this.busy = false;
             }
@@ -1995,12 +2425,26 @@ ${optionsText}`;
         }
 
         stop() {
-            if (!this.busy) {
-                this.report('当前没有正在运行的答题任务', 'normal');
-                return;
+            const task = this.loadTask();
+            const wasRunning = this.busy || Boolean(task?.active);
+            if (task?.active) {
+                task.active = false;
+                task.phase = 'stopped';
+                this.saveTask(task);
             }
             this.busy = false;
-            this.report('正在停止 AI 答题…', 'normal');
+            this.report(wasRunning ? 'AI 答题已停止，进度已保存' : '当前没有正在运行的答题任务', 'normal');
+        }
+
+        autoResume() {
+            clearTimeout(this.resumeTimer);
+            const task = this.loadTask();
+            if (task?.active && this.firstPendingOrder(task) <= Number(task.total)) {
+                this.resumeTimer = setTimeout(() => {
+                    this.report(`正在恢复 AI 自动翻页：第 ${this.firstPendingOrder(task)} / ${task.total} 题`, 'active');
+                    this.runPagedTask();
+                }, 1200);
+            }
         }
     }
 
@@ -2183,11 +2627,11 @@ ${optionsText}`;
                         <section class="card">
                             <h3 class="section-title">AI 答题</h3>
                             <div class="grid">
-                                <button class="button primary full" type="button" data-action="ai-fill">AI 自动答题</button>
+                                <button class="button primary full" type="button" data-action="ai-fill">AI 自动答题（自动翻页）</button>
                                 <button class="button" type="button" data-action="fill-collected">回填已采集答案</button>
                                 <button class="button" type="button" data-action="stop-fill">停止答题</button>
                             </div>
-                            <div class="ai-status" data-role="ai-status">点击"AI 自动答题"将调用 AI 生成答案并自动填充</div>
+                            <div class="ai-status" data-role="ai-status">支持当前页和逐题换页；换页试卷会按题号自动作答并保存进度</div>
                         </section>
 
                         <section class="card">
@@ -2340,7 +2784,9 @@ ${optionsText}`;
                     ? '长卷同页'
                     : mode === 'paged'
                         ? '逐题换页'
-                        : '等待识别';
+                        : mode === 'ai-paged'
+                            ? 'AI 逐题'
+                            : '等待识别';
 
             this.$('[data-role="mode"]').textContent = modeText;
             this.$('[data-role="paper-title"]').textContent = session?.paperTitle || document.title || '等待识别试卷';
@@ -2908,6 +3354,7 @@ ${optionsText}`;
         ui.on('test-ai', () => handleTestAi());
         ui.on('settings', () => ui.refresh());
         collector.autoResume();
+        autoFiller.autoResume();
         return true;
     }
 
@@ -2937,14 +3384,22 @@ ${optionsText}`;
     document.addEventListener('keydown', event => {
         if (event.key === 'Escape') {
             const session = store.load();
+            const aiTask = autoFiller.loadTask();
             if (session?.active) {
                 event.preventDefault();
                 collector.pause('用户按 Esc 暂停采集');
             }
+            if (autoFiller.busy || aiTask?.active) {
+                event.preventDefault();
+                autoFiller.stop();
+            }
         }
     }, true);
 
-    window.addEventListener('pageshow', () => collector.autoResume());
+    window.addEventListener('pageshow', () => {
+        collector.autoResume();
+        autoFiller.autoResume();
+    });
 
     initialize();
 })();

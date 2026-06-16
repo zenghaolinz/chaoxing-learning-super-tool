@@ -290,11 +290,11 @@ node --check chaoxing-answer-exporter.user.js
 发布新版本时，需要同步修改：
 
 ```javascript
-// @version      1.2.2
+// @version      1.2.3
 ```
 
 ```javascript
-version: '1.2.2'
+version: '1.2.3'
 ```
 
 推送到 `main` 分支后，Tampermonkey 会通过脚本中的 `@updateURL` 检查更新。

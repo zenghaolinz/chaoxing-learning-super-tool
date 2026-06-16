@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.3 - 2026-06-16
+
+### Added
+
+- AI 自动翻页答题：在逐题换页模式下自动逐题调用 AI 并回填，支持跨页面断点恢复；
+- `AutoFiller` 独立任务存储（`CXAE_AI_TASK_`），按试卷隔离 AI 答题进度；
+- AI 答题面板增加"开始 AI 答题"和"停止"按钮；
+- 按 `Esc` 可同时暂停采集和 AI 答题任务；
+- 页面恢复（`pageshow`）时自动恢复 AI 答题任务。
+
+### Changed
+
+- AI 生成的答案同时记录到采集结果中（`source: 'ai-generated'`）；
+- `AutoFiller` 支持逐题翻页答题循环（`runPagedTask`）。
+
 ## 1.2.2 - 2026-06-16
 
 ### Added
