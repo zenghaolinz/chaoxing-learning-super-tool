@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答案导出器
 // @namespace    https://github.com/zenghaolinz/chaoxing-answer-exporter
-// @version      1.2.3
+// @version      1.2.4
 // @description  采集超星学习通题目与正确答案，支持逐题换页、长卷同页、随堂练习、AI自动答题、显示答案跳转和断点恢复
 // @author       zenghaolinz
 // @license      MIT
@@ -14,6 +14,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
+// @grant        unsafeWindow
 // @connect      api.deepseek.com
 // @connect      *
 // ==/UserScript==
@@ -24,7 +25,7 @@
     const APP = Object.freeze({
         id: 'cx-answer-exporter',
         name: '超星答案导出器',
-        version: '1.2.3',
+        version: '1.2.4',
         storageVersion: 1,
         sessionPrefix: 'CXAE_SESSION_',
         settingsKey: 'CXAE_SETTINGS',
@@ -576,7 +577,7 @@
         hasQuestions() {
             if (this.hasVuePracticeQuestions() || this.getQuestionNodes().length > 0) return true;
             return Boolean(document.querySelector(
-                'input[type="radio"], input[type="checkbox"], textarea, input[type="text"], [contenteditable="true"], [role="radio"], [role="checkbox"]'
+                'input[type="radio"], input[type="checkbox"], textarea, input[type="text"], [contenteditable="true"], iframe, .ql-editor, .ProseMirror, .w-e-text, [role="radio"], [role="checkbox"]'
             ));
         }
 
@@ -649,7 +650,7 @@
             if (!node) return false;
             if (isVisible(node)) return true;
             const controls = node.querySelectorAll?.(
-                'input, textarea, [contenteditable="true"], [role="radio"], [role="checkbox"], button, a'
+                'input, textarea, iframe, [contenteditable="true"], .ql-editor, .ProseMirror, .w-e-text, [role="radio"], [role="checkbox"], button, a'
             ) || [];
             return Array.from(controls).some(isVisible);
         }
@@ -1115,18 +1116,108 @@
 
         // ---- 自动答题：DOM 填充方法 ----
 
+        isUsableTextControl(element, allowHidden = false) {
+            if (!element || !element.isConnected || element.closest?.(`#${APP.id}-host`)) return false;
+            if (element.matches?.('[disabled], [readonly], [contenteditable="false"]')) return false;
+            if (String(element.tagName || '').toUpperCase() === 'INPUT' && /^(?:hidden|button|submit|reset|file|radio|checkbox)$/i.test(element.type || 'text')) return false;
+            if (allowHidden) return true;
+            if (element.ownerDocument !== document) return true;
+            return isVisible(element);
+        }
+
+        getFrameEditorBodies(root) {
+            const result = [];
+            const seen = new Set();
+            for (const iframe of Array.from(root?.querySelectorAll?.('iframe') || [])) {
+                if (iframe.closest?.(`#${APP.id}-host`)) continue;
+                try {
+                    const frameDocument = iframe.contentDocument || iframe.contentWindow?.document;
+                    if (!frameDocument?.body) continue;
+                    const frameHint = `${iframe.id || ''} ${iframe.name || ''} ${iframe.className || ''} ${iframe.src || ''}`;
+                    const editorHint = /editor|ueditor|ckeditor|wysiwyg|tinymce|tox|mce|quill|answer|textarea/i.test(frameHint);
+                    const candidates = Array.from(frameDocument.querySelectorAll(
+                        '[contenteditable="true"], textarea:not([readonly]):not([disabled]), input[type="text"]:not([readonly]):not([disabled]), .ql-editor, .ProseMirror, .w-e-text'
+                    ));
+                    if (!candidates.length && (frameDocument.body.isContentEditable || editorHint)) {
+                        candidates.push(frameDocument.body);
+                    }
+                    for (const candidate of candidates) {
+                        if (seen.has(candidate)) continue;
+                        seen.add(candidate);
+                        result.push(candidate);
+                    }
+                } catch (error) {
+                    console.debug('[CXAE] 无法访问富文本 iframe，可能是跨域编辑器。', error);
+                }
+            }
+            return result;
+        }
+
+        getNearbyTextControls(questionNode) {
+            const selector = [
+                'textarea:not([readonly]):not([disabled])',
+                'input[type="text"]:not([readonly]):not([disabled])',
+                'input:not([type]):not([readonly]):not([disabled])',
+                '[contenteditable="true"]',
+                '.ql-editor', '.ProseMirror', '.w-e-text',
+                '[class*="answer"] textarea', '[class*="answer"] input[type="text"]',
+                '[class*="blank"] input[type="text"]', '[class*="editor"] [contenteditable="true"]'
+            ].join(',');
+            const result = [];
+            const seen = new Set();
+            const addFrom = (root, allowHidden = false) => {
+                for (const element of Array.from(root?.querySelectorAll?.(selector) || [])) {
+                    if (seen.has(element) || !this.isUsableTextControl(element, allowHidden)) continue;
+                    seen.add(element);
+                    result.push(element);
+                }
+                for (const element of this.getFrameEditorBodies(root)) {
+                    if (!seen.has(element)) {
+                        seen.add(element);
+                        result.push(element);
+                    }
+                }
+            };
+
+            addFrom(questionNode);
+            if (result.length) return result;
+
+            let ancestor = questionNode?.parentElement;
+            for (let depth = 0; ancestor && depth < 3 && ancestor !== document.body; depth += 1, ancestor = ancestor.parentElement) {
+                addFrom(ancestor);
+                if (result.length) return result;
+            }
+
+            // 某些新版页面把富文本编辑器挂在题目容器的同级节点。只选择题目附近、且名称明显像答案区的控件。
+            const questionRect = questionNode?.getBoundingClientRect?.();
+            const documentCandidates = Array.from(document.querySelectorAll(selector));
+            for (const element of documentCandidates) {
+                if (seen.has(element) || !this.isUsableTextControl(element)) continue;
+                const hint = `${element.id || ''} ${element.className || ''} ${element.getAttribute?.('name') || ''} ${element.getAttribute?.('placeholder') || ''}`;
+                if (!/answer|blank|editor|content|subject|question|reply|textarea|填空|答案|作答|请输入/i.test(hint)) continue;
+                if (questionRect) {
+                    const rect = element.getBoundingClientRect();
+                    const verticallyNear = rect.bottom >= questionRect.top - 80 && rect.top <= questionRect.bottom + 900;
+                    const horizontallyOverlaps = rect.right >= questionRect.left - 80 && rect.left <= questionRect.right + 80;
+                    if (!verticallyNear || !horizontallyOverlaps) continue;
+                }
+                seen.add(element);
+                result.push(element);
+            }
+            return result;
+        }
+
         findAnswerInputs(questionNode) {
             if (!questionNode) {
-                return { radios: [], checkboxes: [], textInputs: [], textareas: [], contentEditables: [] };
+                return { radios: [], checkboxes: [], textInputs: [], textareas: [], contentEditables: [], textControls: [] };
             }
             const radios = Array.from(questionNode.querySelectorAll('input[type="radio"], [role="radio"]'));
             const checkboxes = Array.from(questionNode.querySelectorAll('input[type="checkbox"], [role="checkbox"]'));
-            const textInputs = Array.from(questionNode.querySelectorAll(
-                'input[type="text"]:not([readonly]):not([disabled]), input:not([type]):not([readonly]):not([disabled])'
-            ));
-            const textareas = Array.from(questionNode.querySelectorAll('textarea:not([readonly]):not([disabled])'));
-            const contentEditables = Array.from(questionNode.querySelectorAll('[contenteditable="true"]'));
-            return { radios, checkboxes, textInputs, textareas, contentEditables };
+            const textControls = this.getNearbyTextControls(questionNode);
+            const textInputs = textControls.filter(element => String(element.tagName || '').toUpperCase() === 'INPUT');
+            const textareas = textControls.filter(element => String(element.tagName || '').toUpperCase() === 'TEXTAREA');
+            const contentEditables = textControls.filter(element => !textInputs.includes(element) && !textareas.includes(element));
+            return { radios, checkboxes, textInputs, textareas, contentEditables, textControls };
         }
 
         getOptionElements(questionNode) {
@@ -1261,6 +1352,7 @@
         }
 
         fillQuestion(questionNode, answer, type) {
+            this.lastFillError = '';
             if (!questionNode || !normalizeText(answer)) return false;
             const cleanType = normalizeText(type || '');
 
@@ -1268,7 +1360,7 @@
             if (/多选/.test(cleanType)) return this.fillMultipleChoice(questionNode, answer);
             if (/单选/.test(cleanType)) return this.fillSingleChoice(questionNode, answer);
             if (/填空/.test(cleanType)) return this.fillBlank(questionNode, answer);
-            if (/简答|论述|问答/.test(cleanType)) return this.fillEssay(questionNode, answer);
+            if (/简答|论述|问答|名词解释|解释题|材料分析|案例分析|翻译|写作|计算题/.test(cleanType)) return this.fillEssay(questionNode, answer);
 
             const { radios, checkboxes, textInputs, textareas, contentEditables } = this.findAnswerInputs(questionNode);
             if (checkboxes.length) return this.fillMultipleChoice(questionNode, answer);
@@ -1316,51 +1408,242 @@
             return false;
         }
 
-        setNativeValue(element, value) {
-            if (!element) return false;
-            if (element.getAttribute?.('contenteditable') === 'true') {
-                element.focus?.();
-                element.textContent = value;
-                element.dispatchEvent(new InputEvent('input', {
+        dispatchTextEvent(element, type, data = null, inputType = 'insertText', cancelable = false) {
+            try {
+                const EventConstructor = element.ownerDocument?.defaultView?.InputEvent || InputEvent;
+                return element.dispatchEvent(new EventConstructor(type, {
                     bubbles: true,
-                    inputType: 'insertText',
-                    data: value,
+                    cancelable,
+                    composed: true,
+                    data,
+                    inputType,
                 }));
-                element.dispatchEvent(new Event('change', { bubbles: true }));
-                element.blur?.();
-                return normalizeText(element.textContent) === normalizeText(value);
+            } catch {
+                return element.dispatchEvent(new Event(type, { bubbles: true, cancelable }));
+            }
+        }
+
+        setKnownEditorValue(element, value) {
+            const targetValue = String(value ?? '');
+            const ownerDocument = element?.ownerDocument;
+            if (!ownerDocument) return false;
+            let frame = null;
+            if (ownerDocument !== document) {
+                frame = Array.from(document.querySelectorAll('iframe')).find(candidate => {
+                    try { return candidate.contentDocument === ownerDocument; } catch { return false; }
+                }) || null;
             }
 
-            const prototype = element instanceof HTMLTextAreaElement
-                ? HTMLTextAreaElement.prototype
-                : HTMLInputElement.prototype;
-            const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
-            if (setter) setter.call(element, value);
-            else element.value = value;
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-            element.dispatchEvent(new Event('change', { bubbles: true }));
-            return String(element.value) === String(value);
+            try {
+                const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+                const tinyEditors = Array.from(pageWindow?.tinymce?.editors || []);
+                const tinyEditor = tinyEditors.find(editor => editor?.iframeElement === frame || editor?.getBody?.() === element);
+                if (tinyEditor) {
+                    tinyEditor.setContent(targetValue.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>'));
+                    tinyEditor.fire?.('input');
+                    tinyEditor.fire?.('change');
+                    return normalizeText(tinyEditor.getContent?.({ format: 'text' }) || '') === normalizeText(targetValue);
+                }
+
+                const ckInstances = Object.values(pageWindow?.CKEDITOR?.instances || {});
+                const ckEditor = ckInstances.find(editor => editor?.document?.$ === ownerDocument || editor?.window?.$ === frame?.contentWindow);
+                if (ckEditor) {
+                    ckEditor.setData(targetValue.replace(/\n/g, '<br>'));
+                    ckEditor.fire?.('change');
+                    return true;
+                }
+
+                const ueInstances = Object.values(pageWindow?.UE?.instants || pageWindow?.UE?.instances || {});
+                const ueEditor = ueInstances.find(editor => editor?.iframe === frame || editor?.document === ownerDocument || editor?.body === element);
+                if (ueEditor?.setContent) {
+                    ueEditor.setContent(targetValue.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>'));
+                    ueEditor.fireEvent?.('contentchange');
+                    return true;
+                }
+            } catch (error) {
+                console.debug('[CXAE] 富文本编辑器 API 写入失败，改用 DOM 输入。', error);
+            }
+            return false;
+        }
+
+        syncEditorMirror(element, value) {
+            const ownerDocument = element?.ownerDocument;
+            if (!ownerDocument) return;
+            let container = element;
+            if (ownerDocument !== document) {
+                const frame = Array.from(document.querySelectorAll('iframe')).find(candidate => {
+                    try { return candidate.contentDocument === ownerDocument; } catch { return false; }
+                });
+                container = frame?.parentElement || frame || element;
+            }
+            const scope = container?.closest?.('[class*="editor"], [class*="answer"], [class*="question"], [class*="subject"]') || container?.parentElement;
+            for (const mirror of Array.from(scope?.querySelectorAll?.('textarea, input[type="hidden"]') || [])) {
+                if (mirror === element || mirror.disabled || mirror.readOnly) continue;
+                try {
+                    const mirrorWindow = mirror.ownerDocument?.defaultView || window;
+                    const prototype = String(mirror.tagName || '').toUpperCase() === 'TEXTAREA'
+                        ? mirrorWindow.HTMLTextAreaElement?.prototype
+                        : mirrorWindow.HTMLInputElement?.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+                    if (setter) setter.call(mirror, String(value ?? ''));
+                    else mirror.value = String(value ?? '');
+                    mirror.dispatchEvent(new Event('input', { bubbles: true }));
+                    mirror.dispatchEvent(new Event('change', { bubbles: true }));
+                } catch { /* mirror is only a best-effort fallback */ }
+            }
+        }
+
+        setNativeValue(element, value) {
+            if (!element) return false;
+            const targetValue = String(value ?? '');
+            this.lastFillError = '';
+
+            if (this.setKnownEditorValue(element, targetValue)) {
+                this.syncEditorMirror(element, targetValue);
+                return true;
+            }
+
+            const isEditable = element.getAttribute?.('contenteditable') === 'true' ||
+                element.isContentEditable ||
+                /^(?:BODY|DIV|P)$/i.test(element.tagName || '') &&
+                    /editor|wysiwyg|ql-editor|ProseMirror|w-e-text|mce-content-body/i.test(`${element.id || ''} ${element.className || ''}`);
+
+            if (isEditable) {
+                try {
+                    const ownerDocument = element.ownerDocument || document;
+                    element.focus?.();
+                    const selection = ownerDocument.getSelection?.();
+                    if (selection) {
+                        const range = ownerDocument.createRange();
+                        range.selectNodeContents(element);
+                        selection.removeAllRanges();
+                        selection.addRange(range);
+                    }
+
+                    this.dispatchTextEvent(element, 'beforeinput', targetValue, 'insertText', true);
+                    let inserted = false;
+                    try {
+                        inserted = Boolean(ownerDocument.execCommand?.('insertText', false, targetValue));
+                    } catch { /* use DOM fallback */ }
+                    if (!inserted || normalizeText(element.innerText || element.textContent || '') !== normalizeText(targetValue)) {
+                        element.textContent = targetValue;
+                    }
+                    this.dispatchTextEvent(element, 'input', targetValue, 'insertText');
+                    element.dispatchEvent(new Event('change', { bubbles: true }));
+                    element.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
+                    element.blur?.();
+                    this.syncEditorMirror(element, targetValue);
+                    const actual = normalizeText(element.innerText || element.textContent || '');
+                    if (actual === normalizeText(targetValue)) return true;
+                    this.lastFillError = '富文本编辑器写入后内容未保留';
+                    return false;
+                } catch (error) {
+                    this.lastFillError = `富文本编辑器写入失败：${error?.message || String(error)}`;
+                    return false;
+                }
+            }
+
+            const elementTag = String(element.tagName || '').toUpperCase();
+            if (!(elementTag === 'INPUT' || elementTag === 'TEXTAREA')) {
+                this.lastFillError = '未识别到可写入的文本控件';
+                return false;
+            }
+
+            try {
+                element.focus?.();
+                const elementWindow = element.ownerDocument?.defaultView || window;
+                const prototype = elementTag === 'TEXTAREA'
+                    ? elementWindow.HTMLTextAreaElement?.prototype
+                    : elementWindow.HTMLInputElement?.prototype;
+                const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+                const assign = nextValue => {
+                    if (setter) setter.call(element, nextValue);
+                    else element.value = nextValue;
+                };
+                const previousValue = String(element.value || '');
+                element._valueTracker?.setValue?.(previousValue);
+
+                this.dispatchTextEvent(element, 'beforeinput', null, 'deleteContentBackward', true);
+                assign('');
+                this.dispatchTextEvent(element, 'input', null, 'deleteContentBackward');
+
+                // 不触发 paste 事件，按输入事件逐段写入。这样可兼容“禁止粘贴”以及 Vue/React 受控输入框。
+                const chunkSize = targetValue.length > 600 ? 48 : targetValue.length > 160 ? 16 : 1;
+                let currentValue = '';
+                for (let index = 0; index < targetValue.length; index += chunkSize) {
+                    const chunk = targetValue.slice(index, index + chunkSize);
+                    this.dispatchTextEvent(element, 'beforeinput', chunk, 'insertText', true);
+                    currentValue += chunk;
+                    assign(currentValue);
+                    try { element.setSelectionRange?.(currentValue.length, currentValue.length); } catch { /* ignore */ }
+                    this.dispatchTextEvent(element, 'input', chunk, 'insertText');
+                }
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+                element.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Unidentified' }));
+                element.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
+                element.blur?.();
+                this.syncEditorMirror(element, targetValue);
+
+                if (String(element.value) === targetValue) return true;
+                this.lastFillError = `文本框写入后只保留了 ${String(element.value || '').length}/${targetValue.length} 个字符`;
+                return false;
+            } catch (error) {
+                this.lastFillError = `文本框写入失败：${error?.message || String(error)}`;
+                return false;
+            }
+        }
+
+        splitBlankAnswers(answer, expectedCount = 1) {
+            const text = String(answer ?? '').trim();
+            if (!text) return [];
+            try {
+                const parsed = JSON.parse(text);
+                if (Array.isArray(parsed)) return parsed.map(normalizeText).filter(Boolean);
+                if (Array.isArray(parsed?.answer)) return parsed.answer.map(normalizeText).filter(Boolean);
+            } catch { /* plain text answer */ }
+
+            if (expectedCount <= 1) return [normalizeText(text)];
+            const cleaners = value => normalizeText(value).replace(/^第?\s*\d+\s*空?\s*[.、:：)）-]?\s*/, '');
+            const byPipe = text.split(/\s*\|\s*/).map(cleaners).filter(Boolean);
+            if (byPipe.length >= expectedCount) return byPipe;
+            const byLine = text.split(/\n+/).map(cleaners).filter(Boolean);
+            if (byLine.length >= expectedCount) return byLine;
+            const bySemicolon = text.split(/[;；]/).map(cleaners).filter(Boolean);
+            if (bySemicolon.length >= expectedCount) return bySemicolon;
+            return byPipe.length ? byPipe : [normalizeText(text)];
         }
 
         fillBlank(questionNode, answer) {
-            const { textInputs, textareas, contentEditables } = this.findAnswerInputs(questionNode);
-            const inputs = textInputs.length ? textInputs : (textareas.length ? textareas : contentEditables);
-            if (!inputs.length) return false;
+            const { textInputs, textareas, contentEditables, textControls } = this.findAnswerInputs(questionNode);
+            const inputs = textControls?.length ? textControls : [...textInputs, ...textareas, ...contentEditables];
+            if (!inputs.length) {
+                this.lastFillError = '未识别到填空输入框或富文本编辑器';
+                return false;
+            }
 
-            const parts = String(answer).split(/\|/).map(normalizeText).filter(Boolean);
-            if (!parts.length) return false;
+            const parts = this.splitBlankAnswers(answer, inputs.length);
+            if (!parts.length) {
+                this.lastFillError = 'AI 未返回填空答案';
+                return false;
+            }
             let filled = 0;
             inputs.forEach((input, index) => {
                 const value = parts[index] ?? (inputs.length === 1 ? parts.join('|') : '');
                 if (value && this.setNativeValue(input, value)) filled += 1;
             });
-            return filled > 0;
+            if (filled === inputs.length) return true;
+            this.lastFillError ||= `只成功填写 ${filled}/${inputs.length} 个空`;
+            return false;
         }
 
         fillEssay(questionNode, answer) {
-            const { textareas, textInputs, contentEditables } = this.findAnswerInputs(questionNode);
-            const input = textareas[0] || contentEditables[0] || textInputs[0];
-            return input ? this.setNativeValue(input, answer) : false;
+            const { textareas, textInputs, contentEditables, textControls } = this.findAnswerInputs(questionNode);
+            const input = textareas[0] || contentEditables[0] || textInputs[0] || textControls?.[0];
+            if (!input) {
+                this.lastFillError = '未识别到问答题输入框或富文本编辑器';
+                return false;
+            }
+            return this.setNativeValue(input, answer);
         }
 
         fillByOptionText(questionNode, answer, inputType = 'radio') {
@@ -1619,7 +1902,7 @@
                 typeInstruction = '这是判断题，只返回“对”或“错”。';
             } else if (/填空/.test(cleanType)) {
                 typeInstruction = '这是填空题，只返回答案；多个空用 | 分隔。';
-            } else if (/简答|论述|问答/.test(cleanType)) {
+            } else if (/简答|论述|问答|名词解释|解释题|材料分析|案例分析|翻译|写作|计算题/.test(cleanType)) {
                 typeInstruction = '这是简答题，只返回简明、准确的答案正文。';
             } else {
                 typeInstruction = '请判断题型并只返回答案本身：单选返回一个字母，多选返回逗号分隔字母，判断返回“对”或“错”，填空多空用 | 分隔。';
@@ -1685,7 +1968,7 @@ ${optionsText}`;
                 model: provider.model,
                 messages,
                 temperature: 0.1,
-                max_tokens: 1024,
+                max_tokens: 2048,
             };
 
             // DeepSeek V4 默认可能进入思考模式。答题只需要简短最终答案，关闭思考可避免
@@ -2328,7 +2611,7 @@ ${optionsText}`;
                             );
                         } else {
                             task.failed += 1;
-                            task.lastError = `第 ${order} 题：答案“${result.answer}”未能匹配页面控件`;
+                            task.lastError = `第 ${order} 题：答案“${result.answer}”未能匹配页面控件${this.adapter.lastFillError ? `（${this.adapter.lastFillError}）` : ''}`;
                             console.warn(
                                 `[CXAE] AI自动翻页 第${order}题 填充失败：答案=${result.answer}，题型=${item.type}`
                             );

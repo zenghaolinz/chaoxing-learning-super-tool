@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.4 - 2026-06-16
+
+### Added
+
+- AI 自动翻页答题任务持久化（`aiTaskPrefix`、`aiNavigationTimeout`）；
+- 申请新权限 `unsafeWindow` 用于访问页面上下文；
+- AI Prompt 简化为直接输出答案文本，不再要求 JSON 格式返回；
+- 官方 DeepSeek API 自动去除 `/v1` 后缀并映射旧模型名（`deepseek-chat` → `deepseek-v4-flash`，`deepseek-reasoner` → `deepseek-v4-pro`）；
+- `AIClient.resolveProviderSettings()` 统一处理 API 地址和模型配置；
+- 简答题题型识别扩展（名词解释、解释题、材料分析、案例分析、翻译、写作、计算题）。
+
+### Changed
+
+- AI 返回结果直接解析为纯文本，不再尝试 JSON 解析；
+- API Key 安全存储流程优化。
+
 ## 1.2.3 - 2026-06-16
 
 ### Added
