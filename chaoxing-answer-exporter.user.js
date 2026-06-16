@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         超星答案导出器
 // @namespace    https://github.com/zenghaolinz/chaoxing-answer-exporter
-// @version      1.0.0
-// @description  采集超星学习通试卷题目与正确答案，支持逐题换页、长卷同页、显示答案跳转和断点恢复
+// @version      1.1.0
+// @description  采集超星学习通题目与正确答案，支持逐题换页、长卷同页、随堂练习、显示答案跳转和断点恢复
 // @author       zenghaolinz
 // @license      MIT
 // @homepageURL  https://github.com/zenghaolinz/chaoxing-answer-exporter
@@ -21,7 +21,7 @@
     const APP = Object.freeze({
         id: 'cx-answer-exporter',
         name: '超星答案导出器',
-        version: '1.0.0',
+        version: '1.1.0',
         storageVersion: 1,
         sessionPrefix: 'CXAE_SESSION_',
         settingsKey: 'CXAE_SETTINGS',
@@ -117,8 +117,8 @@
         getScope() {
             const url = new URL(location.href);
             const stable = [];
-            const preferredKeys = ['courseId', 'classId', 'tId'];
-            const fallbackKeys = ['testId', 'examId', 'paperId', 'workId', 'id'];
+            const preferredKeys = ['courseId', 'classId', 'tId', 'activeId', 'activePrimaryId', 'quizId'];
+            const fallbackKeys = ['testId', 'examId', 'paperId', 'workId', 'relationId', 'id'];
 
             preferredKeys.forEach(key => {
                 const value = url.searchParams.get(key);
@@ -135,6 +135,11 @@
                 }
             }
 
+            const practice = this.getVuePracticeContext();
+            const active = practice?.data?.active;
+            const activityId = active?.id || active?.activeId || active?.fid || active?.relationId;
+            if (activityId) stable.push(`activityId=${activityId}`);
+
             if (stable.length) {
                 return `${url.origin}?${Array.from(new Set(stable)).sort().join('&')}`;
             }
@@ -143,6 +148,218 @@
                 document.querySelector('.mark_title, .testTit, .exam-title, h1')?.textContent || document.title
             );
             return `${url.origin}${url.pathname}|${title}`;
+        }
+
+        getVuePracticeContext() {
+            const instances = [];
+            const seen = new Set();
+            const direct = document.querySelector('#main')?.__vue__;
+            if (direct) {
+                instances.push(direct);
+                seen.add(direct);
+            }
+
+            for (const element of document.querySelectorAll('*')) {
+                const vm = element.__vue__;
+                if (!vm || seen.has(vm)) continue;
+                seen.add(vm);
+                instances.push(vm);
+            }
+
+            for (const vm of instances) {
+                const data = vm?.$data;
+                const list = data?.questionList;
+                if (Array.isArray(list) && list.length > 0) {
+                    return { vm, data, list };
+                }
+            }
+            return null;
+        }
+
+        hasVuePracticeQuestions() {
+            return Boolean(this.getVuePracticeContext()?.list?.length);
+        }
+
+        htmlToText(value) {
+            const html = String(value ?? '');
+            if (!html) return '';
+            const template = document.createElement('template');
+            template.innerHTML = html
+                .replace(/<br\s*\/?>/gi, '\n')
+                .replace(/<\/p\s*>/gi, '</p>\n')
+                .replace(/<\/div\s*>/gi, '</div>\n');
+            return normalizeText(template.content.textContent || '');
+        }
+
+        parseMaybeJson(value, fallback = []) {
+            if (Array.isArray(value)) return value;
+            if (value && typeof value === 'object') return value;
+            if (typeof value !== 'string') return fallback;
+            const trimmed = value.trim();
+            if (!trimmed) return fallback;
+            try {
+                return JSON.parse(trimmed);
+            } catch {
+                return fallback;
+            }
+        }
+
+        normalizeVueAnswer(value) {
+            if (value == null) return '';
+            if (typeof value === 'string') {
+                const parsed = this.parseMaybeJson(value, null);
+                if (parsed !== null) return this.normalizeVueAnswer(parsed);
+                return this.htmlToText(value);
+            }
+            if (Array.isArray(value)) {
+                return value
+                    .map(item => this.normalizeVueAnswer(item))
+                    .filter(Boolean)
+                    .join('、');
+            }
+            if (typeof value === 'object') {
+                const candidate = value.content ?? value.answer ?? value.value ?? value.name ?? value.label;
+                if (candidate != null) return this.normalizeVueAnswer(candidate);
+                return '';
+            }
+            return normalizeText(value);
+        }
+
+        getVueOptionObjects(question) {
+            const fromOptions = this.parseMaybeJson(question?.options, []);
+            if (Array.isArray(fromOptions) && fromOptions.length) return fromOptions;
+
+            const fromAnswer = question?.answer;
+            if (
+                Array.isArray(fromAnswer) &&
+                fromAnswer.length >= 2 &&
+                fromAnswer.every(item => item && typeof item === 'object' && ('content' in item || 'name' in item))
+            ) {
+                return fromAnswer;
+            }
+            return [];
+        }
+
+        formatVueOptions(question) {
+            const result = [];
+            const seen = new Set();
+            for (const option of this.getVueOptionObjects(question)) {
+                const label = normalizeText(option?.name ?? option?.key ?? option?.label ?? option?.code ?? '');
+                const content = this.htmlToText(option?.content ?? option?.value ?? option?.text ?? option?.title ?? '');
+                if (!label && !content) continue;
+                const value = label && content && label !== content
+                    ? `${label}. ${content}`
+                    : (content || label);
+                if (seen.has(value)) continue;
+                seen.add(value);
+                result.push(value);
+            }
+            return result;
+        }
+
+        inferVueQuestionType(question, options, answer) {
+            const rawType = question?.questionTypeName ?? question?.typeName ?? question?.questionType ?? question?.questiontype ?? question?.type;
+            if (typeof rawType === 'string' && /题/.test(rawType)) return normalizeText(rawType);
+
+            const optionContents = this.getVueOptionObjects(question)
+                .map(option => this.htmlToText(option?.content ?? option?.value ?? option?.text ?? ''))
+                .filter(Boolean);
+            const judgementSet = new Set(optionContents);
+            if (
+                optionContents.length === 2 &&
+                (judgementSet.has('对') || judgementSet.has('正確') || judgementSet.has('正确')) &&
+                (judgementSet.has('错') || judgementSet.has('錯'))
+            ) {
+                return '判断题';
+            }
+
+            if (!options.length) {
+                const content = this.htmlToText(question?.content ?? question?.questionContent ?? '');
+                return /_{2,}|第\s*\d+\s*空|填空/.test(content) ? '填空题' : '简答题';
+            }
+
+            const answerParts = String(answer || '').split(/[、,，;；\s]+/).filter(Boolean);
+            return answerParts.length > 1 ? '多选题' : '单选题';
+        }
+
+        extractHtmlImages(...values) {
+            const result = [];
+            const seen = new Set();
+            for (const value of values.flat(Infinity)) {
+                if (value == null) continue;
+                const html = typeof value === 'object'
+                    ? String(value.content ?? value.value ?? value.text ?? '')
+                    : String(value);
+                if (!html || !/<img\b/i.test(html)) continue;
+                const template = document.createElement('template');
+                template.innerHTML = html;
+                template.content.querySelectorAll('img').forEach(image => {
+                    const source = image.getAttribute('src') || image.getAttribute('data-src') || image.getAttribute('data-original');
+                    if (!source) return;
+                    let absolute = source;
+                    try { absolute = new URL(source, location.href).href; } catch {}
+                    if (seen.has(absolute)) return;
+                    seen.add(absolute);
+                    result.push(absolute);
+                });
+            }
+            return result;
+        }
+
+        parseVuePracticeQuestion(question, fallbackOrder = 0) {
+            if (!question || typeof question !== 'object') return null;
+            const contentHtml = question.content ?? question.questionContent ?? question.title ?? question.name ?? '';
+            const title = this.htmlToText(contentHtml);
+            if (!title) return null;
+
+            const options = this.formatVueOptions(question);
+            const answer = this.normalizeVueAnswer(
+                question.rightAnswer ??
+                question.correctAnswer ??
+                question.standardAnswer ??
+                question.rightOption ??
+                question.rightOptions ??
+                question.answerContent
+            );
+            const order = Number(
+                question.order ??
+                question.sort ??
+                question.serialNo ??
+                question.questionNo ??
+                question.no ??
+                fallbackOrder
+            ) || fallbackOrder;
+            const optionObjects = this.getVueOptionObjects(question);
+
+            return {
+                order,
+                type: this.inferVueQuestionType(question, options, answer),
+                question: title,
+                options,
+                answer: this.cleanAnswer(answer),
+                images: this.extractHtmlImages(contentHtml, optionObjects),
+                sourceUrl: location.href,
+                source: 'vue-practice',
+                sourceId: question.id ?? question.questionId ?? null,
+            };
+        }
+
+        getVuePracticeItems() {
+            const context = this.getVuePracticeContext();
+            if (!context) return [];
+            return context.list
+                .map((question, index) => this.parseVuePracticeQuestion(question, index + 1))
+                .filter(Boolean);
+        }
+
+        async waitForVuePractice(timeout = APP.questionWaitTimeout) {
+            const startedAt = Date.now();
+            while (Date.now() - startedAt < timeout) {
+                const context = this.getVuePracticeContext();
+                if (context?.list?.length) return context;
+                await sleep(250);
+            }
+            return null;
         }
 
         getQuestionNodes() {
@@ -167,7 +384,7 @@
         }
 
         hasQuestions() {
-            return this.getQuestionNodes().length > 0;
+            return this.hasVuePracticeQuestions() || this.getQuestionNodes().length > 0;
         }
 
         findTitleNode(question) {
@@ -357,6 +574,7 @@
         }
 
         detectMode() {
+            if (this.hasVuePracticeQuestions()) return 'practice-vue';
             return this.getQuestionNodes().length > 1 ? 'long-page' : 'paged';
         }
 
@@ -381,6 +599,9 @@
                 .filter(textValue => /^\d{1,5}$/.test(textValue))
                 .map(Number);
             if (navNumbers.length >= 5) values.push(Math.max(...navNumbers));
+
+            const practiceCount = this.getVuePracticeContext()?.list?.length || 0;
+            if (practiceCount) values.push(practiceCount);
 
             return values.length ? Math.max(...values) : 0;
         }
@@ -524,8 +745,9 @@
         }
 
         getPaperTitle() {
+            const practiceTitle = this.getVuePracticeContext()?.data?.active?.name;
             return normalizeText(
-                document.querySelector('.mark_title, .testTit, .exam-title, h1')?.textContent || document.title
+                practiceTitle || document.querySelector('.mark_title, .testTit, .exam-title, h1')?.textContent || document.title
             ).replace(/[-_|]\s*超星.*$/i, '') || '超星题目';
         }
     }
@@ -985,7 +1207,13 @@
             const session = this.store.load();
             const stats = this.store.stats(session);
             const mode = session?.mode || 'unknown';
-            const modeText = mode === 'long-page' ? '长卷同页' : mode === 'paged' ? '逐题换页' : '等待识别';
+            const modeText = mode === 'practice-vue'
+                ? '随堂练习'
+                : mode === 'long-page'
+                    ? '长卷同页'
+                    : mode === 'paged'
+                        ? '逐题换页'
+                        : '等待识别';
 
             this.$('[data-role="mode"]').textContent = modeText;
             this.$('[data-role="paper-title"]').textContent = session?.paperTitle || document.title || '等待识别试卷';
@@ -1045,7 +1273,7 @@
         createSession(mode) {
             const session = this.store.create(mode);
             session.active = true;
-            session.phase = mode === 'long-page' ? 'collecting' : 'positioning';
+            session.phase = mode === 'paged' ? 'positioning' : 'collecting';
             return session;
         }
 
@@ -1057,6 +1285,19 @@
             if (session?.active) {
                 this.ui.setStatus('采集任务已经在运行', 'active');
                 await this.resume();
+                return;
+            }
+
+            if (detectedMode === 'practice-vue') {
+                const hasOldData = Boolean(session?.items?.length || session?.skipped?.length);
+                if (hasOldData && !confirm('检测到已有采集数据。随堂练习模式将重新读取当前活动并覆盖同题号内容，是否继续？')) return;
+                session ||= this.createSession('practice-vue');
+                session.mode = 'practice-vue';
+                session.active = true;
+                session.phase = 'collecting';
+                session.total = Math.max(session.total || 0, this.adapter.detectTotal());
+                this.store.save(session);
+                await this.collectVuePractice();
                 return;
             }
 
@@ -1135,6 +1376,10 @@
         }
 
         async scanCurrentPage() {
+            if (this.adapter.detectMode() === 'practice-vue') {
+                await this.collectVuePractice();
+                return;
+            }
             if (this.busy) return;
             this.busy = true;
             try {
@@ -1160,6 +1405,38 @@
                 this.ui.setStatus(`当前页扫描完成：获取 ${stats.answerCount} 个正确答案`, 'success');
             } catch (error) {
                 this.ui.setStatus(error.message || '扫描当前页失败', 'error');
+            } finally {
+                this.busy = false;
+            }
+        }
+
+        async collectVuePractice() {
+            if (this.busy) return;
+            this.busy = true;
+            try {
+                this.ui.setStatus('正在读取随堂练习题目数据…', 'active');
+                const context = await this.adapter.waitForVuePractice();
+                if (!context) throw new Error('未读取到随堂练习的题目数据');
+
+                const items = this.adapter.getVuePracticeItems();
+                if (!items.length) throw new Error('随堂练习题目解析失败');
+
+                let session = this.store.load() || this.createSession('practice-vue');
+                session.mode = 'practice-vue';
+                session.active = true;
+                session.phase = 'collecting';
+                session.paperTitle = this.adapter.getPaperTitle();
+                session.total = Math.max(session.total || 0, items.length);
+
+                for (const item of items) {
+                    if (item.answer) this.store.addItem(session, item);
+                    else this.store.addSkipped(session, item, '题目数据中未提供正确答案');
+                }
+
+                this.finish(session, 'completed');
+            } catch (error) {
+                const session = this.store.load() || this.store.create('practice-vue');
+                this.finish(session, 'error', error.message || '随堂练习采集失败');
             } finally {
                 this.busy = false;
             }
@@ -1474,10 +1751,24 @@
     function initialize() {
         if (mount()) return;
         const observer = new MutationObserver(() => {
-            if (mount()) observer.disconnect();
+            if (mount()) {
+                observer.disconnect();
+                clearInterval(pollTimer);
+            }
         });
         observer.observe(document.documentElement, { childList: true, subtree: true });
-        setTimeout(() => observer.disconnect(), 60000);
+
+        const pollTimer = setInterval(() => {
+            if (mount()) {
+                observer.disconnect();
+                clearInterval(pollTimer);
+            }
+        }, 500);
+
+        setTimeout(() => {
+            observer.disconnect();
+            clearInterval(pollTimer);
+        }, 60000);
     }
 
     document.addEventListener('keydown', event => {
