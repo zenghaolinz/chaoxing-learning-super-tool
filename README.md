@@ -350,30 +350,6 @@ chaoxing-learning-super-tool/
 - 章节测验检测与 AI 作答（`_answerQuizIfPresent` 等）；
 - 跨 iframe 上下文遍历（`_walkFrameContexts`）。
 
-## 开发
-
-语法检查：
-
-```bash
-node --check chaoxing-learning-super-tool.user.js
-```
-
-发布新版本时，需要同步修改脚本内三处版本号：
-
-```javascript
-// @version      1.5.1
-```
-
-```javascript
-version: '1.5.1',           // APP.version
-```
-
-```javascript
-version: '1.5.1',           // StudyAutoPlayer MODULE.version
-```
-
-推送到 `main` 分支后，Tampermonkey 会通过脚本中的 `@updateURL` 检查更新。
-
 ## 已知限制
 
 - 超星不同课程和页面可能使用不同结构；
