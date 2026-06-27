@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.5.1 - 2026-06-27
+
+### Added
+
+- 脚本更名为「学习通超级工具」，合并自动刷课模块；
+- **自动刷课模块（`StudyAutoPlayer`）**：视频自动播放、倍速观看、播放保活恢复、播完自动进入下一节；
+- **章节测验 AI 作答**：自动刷课时检测到章节测验，调用 AI 填写答案并可选自动提交；
+- 跨 iframe 上下文遍历（`_walkFrameContexts`），在 `mooc2-ans` 外壳页退出、交给 frame 内实例运行；
+- 自动刷课控制合并到主浮窗面板，与采集 / 答题共用统一开关；
+- DeepSeek V4 思考模式开关（`aiThinkingEnabled`）；
+- AI 配置增加"测试连接"按钮；
+- 采集翻页间隔可配置（`collectionDelay`）。
+
+### Changed
+
+- 三处版本号统一为 `1.5.1`（header、`APP.version`、`StudyAutoPlayer`）；
+- 脚本文件名由 `chaoxing-answer-exporter.user.js` 改为 `chaoxing-learning-super-tool.user.js`；
+- README 同步更新为「学习通超级工具」，新增自动刷课章节与安装链接。
+
 ## 1.2.4 - 2026-06-16
 
 ### Added

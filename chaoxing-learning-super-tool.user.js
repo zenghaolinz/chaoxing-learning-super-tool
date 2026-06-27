@@ -1,13 +1,14 @@
 // ==UserScript==
-// @name         超星答案导出器
+// @name         学习通超级工具
 // @namespace    https://github.com/zenghaolinz/chaoxing-answer-exporter
-// @version      1.2.4
-// @description  采集超星学习通题目与正确答案，支持逐题换页、长卷同页、随堂练习、AI自动答题、显示答案跳转和断点恢复
+// @version      1.5.1
+// @description  学习通超级工具：题目采集/导出/AI答题/回填 + 视频自动播放、保活、自动下一节、章节测验 AI 作答，统一浮窗开关
 // @author       zenghaolinz
 // @license      MIT
 // @homepageURL  https://github.com/zenghaolinz/chaoxing-answer-exporter
 // @supportURL   https://github.com/zenghaolinz/chaoxing-answer-exporter/issues
 // @match        *://*.chaoxing.com/*
+// @match        *://mobilelearn.chaoxing.com/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
@@ -22,17 +23,38 @@
 (() => {
     'use strict';
 
+    // mooc2-ans 页面经常只是一个 iframe 外壳，真正的题目在 mobilelearn.chaoxing.com 的 frame 内。
+    // 在外壳页挂载面板会导致只能扫到 iframe/底部确认框，无法采集题目；因此外壳页直接退出，交给 iframe 内匹配到的脚本实例运行。
+    function isOuterChaoxingFrameShell() {
+        if (window.top !== window) return false;
+        if (!/mooc2-ans\.chaoxing\.com$/i.test(location.hostname)) return false;
+        const hasQuestionInCurrentDocument = Boolean(document.querySelector(
+            '.question-item, .questionLi, .mark_item, .question-name, .question-title, [data-question-id], [data-questionid]'
+        ));
+        if (hasQuestionInCurrentDocument) return false;
+        return Boolean(document.querySelector(
+            '#frame_content-hd, iframe[src*="mobilelearn.chaoxing.com"], iframe[src*="/page/quiz/"], iframe[src*="/page/active/"]'
+        ));
+    }
+
+    if (isOuterChaoxingFrameShell()) return;
+
     const APP = Object.freeze({
         id: 'cx-answer-exporter',
-        name: '超星答案导出器',
-        version: '1.2.4',
+        name: '学习通超级工具',
+        version: '1.5.1',
         storageVersion: 1,
         sessionPrefix: 'CXAE_SESSION_',
         settingsKey: 'CXAE_SETTINGS',
         aiTaskPrefix: 'CXAE_AI_TASK_',
         maxRevealAttempts: 3,
         maxJumpAttempts: 2,
-        navigationDelay: 650,
+        navigationDelay: 120,
+        domSettleDelay: 90,
+        answerGraceTimeout: 650,
+        answerRevealTimeout: 2800,
+        questionNodeCacheTtl: 180,
+        navigationCacheTtl: 220,
         questionWaitTimeout: 15000,
         aiNavigationTimeout: 12000,
     });
@@ -43,10 +65,18 @@
         aiApiBase: 'https://api.deepseek.com',
         aiApiKey: '',
         aiModel: 'deepseek-v4-flash',
+        aiThinkingEnabled: false,
         autoFillDelay: 500,
+        collectionDelay: 120,
     });
 
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+    function clampNumber(value, minimum, maximum, fallback) {
+        const number = Number(value);
+        if (!Number.isFinite(number)) return fallback;
+        return Math.max(minimum, Math.min(maximum, number));
+    }
 
     function normalizeText(value) {
         return String(value ?? '')
@@ -158,6 +188,96 @@
     const VUE_CACHE_TTL = 2000; // Vue 上下文缓存 2 秒
 
     class ChaoxingAdapter {
+        constructor() {
+            this._domRevision = 0;
+            this._domObserver = null;
+            this._questionNodeCache = null;
+            this._navigationCandidateCache = null;
+        }
+
+        ensureDomObserver() {
+            if (this._domObserver || typeof MutationObserver === 'undefined' || typeof document === 'undefined') return;
+            const root = document.documentElement;
+            if (!root) return;
+            this._domObserver = new MutationObserver(records => {
+                const meaningful = records.some(record => {
+                    const target = record.target?.nodeType === 1 ? record.target : record.target?.parentElement;
+                    return !target?.closest?.(`#${APP.id}-host`);
+                });
+                if (!meaningful) return;
+                this._domRevision += 1;
+                this._questionNodeCache = null;
+                this._navigationCandidateCache = null;
+                _vuePracticeCacheTime = 0;
+            });
+            this._domObserver.observe(root, {
+                childList: true,
+                subtree: true,
+                characterData: true,
+                attributes: true,
+                attributeFilter: ['class', 'style', 'hidden', 'aria-current', 'aria-selected', 'aria-checked', 'value'],
+            });
+        }
+
+        waitForDomCondition(check, { timeout = 5000, interval = 100 } = {}) {
+            this.ensureDomObserver();
+            return new Promise(resolve => {
+                const startedAt = Date.now();
+                let settled = false;
+                let timer = null;
+                let observer = null;
+
+                const finish = value => {
+                    if (settled) return;
+                    settled = true;
+                    if (timer) clearTimeout(timer);
+                    observer?.disconnect();
+                    resolve(value || null);
+                };
+
+                const evaluate = () => {
+                    if (settled) return;
+                    try {
+                        const value = check();
+                        if (value) {
+                            finish(value);
+                            return;
+                        }
+                    } catch (error) {
+                        console.debug('[CXAE] DOM 条件检查失败，继续等待。', error);
+                    }
+                    if (Date.now() - startedAt >= timeout) {
+                        finish(null);
+                        return;
+                    }
+                    timer = setTimeout(evaluate, interval);
+                };
+
+                if (typeof MutationObserver !== 'undefined' && typeof document !== 'undefined' && document.documentElement) {
+                    observer = new MutationObserver(() => {
+                        clearTimeout(timer);
+                        timer = setTimeout(evaluate, 0);
+                    });
+                    observer.observe(document.documentElement, {
+                        childList: true,
+                        subtree: true,
+                        characterData: true,
+                        attributes: true,
+                        attributeFilter: ['class', 'style', 'hidden', 'aria-current', 'aria-selected', 'aria-checked', 'value'],
+                    });
+                }
+                evaluate();
+            });
+        }
+
+        async waitForAnswer(questionNode, order = 0, timeout = APP.answerGraceTimeout) {
+            return this.waitForDomCondition(() => {
+                const node = this.getCurrentQuestionNode(order) || questionNode;
+                const item = this.parseQuestion(node, order || 0);
+                return item?.answer ? { node, item } : null;
+            }, { timeout, interval: 80 });
+        }
+
         getScope() {
             const url = new URL(location.href);
             const stable = [];
@@ -202,7 +322,11 @@
             }
 
             const seen = new Set();
-            const listKeys = ['questionList', 'questions', 'topicList', 'subjectList'];
+            const listKeys = [
+                'questionList', 'questions', 'topicList', 'subjectList',
+                'paperQuestionList', 'examQuestionList', 'testQuestionList',
+                'questionDtos', 'questionVOList', 'allQuestions'
+            ];
 
             const inspectInstance = instance => {
                 let current = instance;
@@ -483,6 +607,16 @@
         }
 
         getQuestionNodes() {
+            this.ensureDomObserver();
+            const now = Date.now();
+            if (
+                this._questionNodeCache &&
+                this._questionNodeCache.revision === this._domRevision &&
+                now - this._questionNodeCache.at <= APP.questionNodeCacheTtl
+            ) {
+                return this._questionNodeCache.nodes.slice();
+            }
+
             const result = [];
             const seenNodes = new Set();
             const signatures = new Set();
@@ -567,23 +701,34 @@
                 result.push(node);
             }
 
-            return result.sort((left, right) => {
+            const sorted = result.sort((left, right) => {
                 if (left === right) return 0;
                 const position = left.compareDocumentPosition(right);
                 return position & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
             });
+            this._questionNodeCache = {
+                revision: this._domRevision,
+                at: Date.now(),
+                nodes: sorted.slice(),
+            };
+            return sorted;
         }
 
         hasQuestions() {
             if (this.hasVuePracticeQuestions() || this.getQuestionNodes().length > 0) return true;
             return Boolean(document.querySelector(
-                'input[type="radio"], input[type="checkbox"], textarea, input[type="text"], [contenteditable="true"], iframe, .ql-editor, .ProseMirror, .w-e-text, [role="radio"], [role="checkbox"]'
+                'input[type="radio"], input[type="checkbox"], textarea, input[type="text"], [contenteditable="true"], .ql-editor, .ProseMirror, .w-e-text, [role="radio"], [role="checkbox"]'
             ));
         }
 
         findTitleNode(question) {
             return question?.querySelector(
-                '.mark_name, [class*="mark_name"], .question-title, .questionTitle, .subject-title, .subjectTitle, .topic-title, .topicTitle, .stem, [class*="question-stem"], [class*="subject-title"], [class*="topic-title"]'
+                '.question-name, [class*="question-name"], .questionName, ' +
+                '.mark_name, [class*="mark_name"], ' +
+                '.question-title, .questionTitle, ' +
+                '.subject-title, .subjectTitle, ' +
+                '.topic-title, .topicTitle, ' +
+                '.stem, [class*="question-stem"], [class*="subject-title"], [class*="topic-title"]'
             ) || null;
         }
 
@@ -602,17 +747,29 @@
                 }
             }
 
-            const targetQuestion = normalizeText(item.question || '')
+            const normalizeQuestionText = value => normalizeText(value || '')
                 .replace(/^\d+\s*[.、．]\s*/, '')
-                .replace(/^[（(][^）)]*题[^）)]*[）)]\s*/, '');
+                .replace(/^[\[【（(]\s*[^\]】）)]*(?:题|題)[^\]】）)]*[\]】）)]\s*/, '')
+                .replace(/[\s ]+/g, '');
+            const targetQuestion = normalizeQuestionText(item.question || '');
             const snippet = targetQuestion.slice(0, 36);
+            let matchedByText = null;
 
             if (snippet) {
                 for (const node of nodes) {
                     if (used.has(node)) continue;
-                    const nodeText = normalizeText(node.innerText || node.textContent || '');
-                    if (nodeText.includes(snippet) || targetQuestion.includes(nodeText.slice(0, 36))) return node;
+                    const parsed = this.parseQuestion(node, 0);
+                    const nodeQuestion = normalizeQuestionText(parsed?.question || node.innerText || node.textContent || '');
+                    if (nodeQuestion.includes(snippet) || targetQuestion.includes(nodeQuestion.slice(0, 36))) {
+                        matchedByText = node;
+                        break;
+                    }
                 }
+                if (matchedByText) return matchedByText;
+
+                // 题干明确但当前页面没有匹配时，不再只按题号硬塞答案。
+                // 这能避免“第5题其实是填空题，却拿到旧的单选 A”这种错位回填。
+                if (targetQuestion.length >= 16) return null;
             }
 
             const targetOrder = Number(item.order) || 0;
@@ -653,6 +810,27 @@
                 'input, textarea, iframe, [contenteditable="true"], .ql-editor, .ProseMirror, .w-e-text, [role="radio"], [role="checkbox"], button, a'
             ) || [];
             return Array.from(controls).some(isVisible);
+        }
+
+        getVisibleQuestionNodes() {
+            return this.getQuestionNodes().filter(node => this.isQuestionNodeVisible(node));
+        }
+
+        getCurrentQuestionNode(expectedOrder = 0) {
+            const nodes = this.getQuestionNodes();
+            if (!nodes.length) return null;
+            const visible = nodes.filter(node => this.isQuestionNodeVisible(node));
+            const candidates = visible.length ? visible : nodes;
+            const targetOrder = Number(expectedOrder) || this.getActiveQuestionNumber();
+
+            if (targetOrder > 0) {
+                const matched = candidates.find(node => {
+                    const parsed = this.parseQuestion(node, 0);
+                    return Number(parsed?.order) === targetOrder;
+                });
+                if (matched) return matched;
+            }
+            return candidates[0] || null;
         }
 
         getVisibleAnswerTargets() {
@@ -709,9 +887,33 @@
             return 0;
         }
 
+        normalizeQuestionType(value) {
+            const text = normalizeText(value);
+            const map = {
+                '單選題': '单选题',
+                '单选題': '单选题',
+                '單选题': '单选题',
+                '多選題': '多选题',
+                '多选題': '多选题',
+                '多選题': '多选题',
+                '判斷題': '判断题',
+                '判断題': '判断题',
+                '判斷题': '判断题',
+                '填空題': '填空题',
+                '簡答題': '简答题',
+                '简答題': '简答题',
+                '論述題': '论述题',
+                '论述題': '论述题',
+            };
+            return map[text] || text.replace(/題/g, '题');
+        }
+
         inferQuestionType(title) {
-            const match = String(title || '').match(/[（(]\s*([^）)]+题)\s*[）)]/);
-            return match ? normalizeText(match[1]) : '未分类';
+            const text = String(title || '');
+            const match =
+                text.match(/[（(]\s*([^）)]+题)\s*[）)]/) ||
+                text.match(/[\[【]\s*([^\]】]+(?:题|題))\s*[\]】]/);
+            return match ? this.normalizeQuestionType(match[1]) : '未分类';
         }
 
         getLabeledSection(question, label, stopLabels = []) {
@@ -733,8 +935,8 @@
         cleanAnswer(value) {
             return String(value || '')
                 .replace(/\u00a0/g, ' ')
-                .replace(/^\s*正确答案\s*[:：]?\s*/i, '')
-                .replace(/\s*(?:答案解析|题目解析|难易度|知识点)\s*[:：]?.*$/s, '')
+                .replace(/^\s*(?:正确答案|正確答案|参考答案|參考答案|标准答案|標準答案)\s*[:：]?\s*/i, '')
+                .replace(/\s*(?:答案解析|答案詳解|答案详解|题目解析|題目解析|难易度|難易度|知识点|知識點)\s*[:：]?.*$/s, '')
                 .replace(/[ \t]+/g, ' ')
                 .trim();
         }
@@ -760,24 +962,23 @@
                 }
             }
 
-            const labeled = this.cleanAnswer(
-                this.getLabeledSection(
-                    question,
-                    '正确答案',
-                    ['答案解析', '题目解析', '难易度', '知识点', '上一题', '下一题']
-                )
-            );
-            if (labeled) return labeled;
+            const answerLabels = ['正确答案', '正確答案', '参考答案', '參考答案', '标准答案', '標準答案'];
+            const stopLabels = ['答案解析', '答案詳解', '答案详解', '题目解析', '題目解析', '难易度', '難易度', '知识点', '知識點', '上一题', '上一題', '下一题', '下一題'];
+            for (const answerLabel of answerLabels) {
+                const labeled = this.cleanAnswer(this.getLabeledSection(question, answerLabel, stopLabels));
+                if (labeled) return labeled;
+            }
 
             const fullText = String(question.innerText || question.textContent || '').replace(/\r/g, '');
-            const lineMatch = fullText.match(/(?:^|\n)\s*正确答案\s*[:：]\s*([^\n]+)/);
+            const lineMatch = fullText.match(/(?:^|\n)\s*(?:正确答案|正確答案|参考答案|參考答案|标准答案|標準答案)\s*[:：]\s*([^\n]+)/);
             if (lineMatch) {
                 const value = this.cleanAnswer(lineMatch[1]);
                 if (value) return value;
             }
 
+            const labelPattern = /^(?:正确答案|正確答案|参考答案|參考答案|标准答案|標準答案)\s*[:：]?$/;
             const labels = Array.from(question.querySelectorAll('span, div, p, i, b, strong'))
-                .filter(element => /^正确答案\s*[:：]?$/.test(normalizeText(element.textContent)));
+                .filter(element => labelPattern.test(normalizeText(element.textContent)));
 
             for (const label of labels) {
                 let sibling = label.nextElementSibling;
@@ -786,7 +987,7 @@
                     if (value) return value;
                 }
 
-                const parentMatch = String(label.parentElement?.innerText || '').match(/正确答案\s*[:：]?\s*([^\n]+)/);
+                const parentMatch = String(label.parentElement?.innerText || '').match(/(?:正确答案|正確答案|参考答案|參考答案|标准答案|標準答案)\s*[:：]?\s*([^\n]+)/);
                 const value = this.cleanAnswer(parentMatch?.[1]);
                 if (value) return value;
             }
@@ -800,8 +1001,12 @@
                 '.answerList li',
                 '.answer-list li',
                 '.question-options li',
+                '.option-list li',
+                '.options li',
                 '.option-item',
+                '.optionItem',
                 '.answer-option',
+                '.answerItem',
             ];
             const options = [];
             const seen = new Set();
@@ -825,6 +1030,31 @@
                 });
             }
 
+            // mobilelearn 题目页常把选项渲染成多行：A / 选项内容 / B / 选项内容，
+            // 而不是 “A. 选项内容”。这里补一层分行识别。
+            if (!options.length) {
+                const lines = this.getLines(question);
+                for (let index = 0; index < lines.length; index += 1) {
+                    const letter = this.normalizeOptionLetter(lines[index]).match(/^([A-H])$/)?.[1];
+                    if (!letter) continue;
+
+                    const parts = [];
+                    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+                        const nextLetter = this.normalizeOptionLetter(lines[cursor]).match(/^([A-H])$/)?.[1];
+                        if (nextLetter) break;
+                        if (/^第\s*\d+\s*空/.test(lines[cursor])) break;
+                        if (/^(我的答案|正确答案|正確答案|参考答案|參考答案|标准答案|標準答案|答案解析|答案詳解|题目解析|題目解析)/.test(lines[cursor])) break;
+                        parts.push(lines[cursor]);
+                    }
+
+                    const value = `${letter}. ${parts.join(' ')}`.trim();
+                    if (parts.length && !seen.has(value)) {
+                        seen.add(value);
+                        options.push(value);
+                    }
+                }
+            }
+
             return options;
         }
 
@@ -840,6 +1070,21 @@
             return result;
         }
 
+        inferQuestionTypeFromNode(question, title = '') {
+            let type = this.inferQuestionType(title || this.findTitleNode(question)?.textContent || '');
+            const blankInputs = question?.querySelectorAll?.('input.ofl-ipt, input[type="text"].ofl-ipt, input[type="text"][class*="blank"], input[type="text"][class*="fill"]') || [];
+            if (blankInputs.length) return '填空题';
+
+            // mobilelearn 的判断题通常没有 radio，只有两个 li 文本“对/错”或“對/錯”。
+            const options = this.getOptionElements?.(question) || [];
+            const optionTexts = options.map(option => normalizeText(option.innerText || option.textContent || '')
+                .replace(/^[A-HＡ-Ｈ]\s*[.、．:：)）]?\s*/, '')
+            ).filter(Boolean);
+            const judgementWords = optionTexts.filter(text => /^(对|對|正确|正確|√|是|T|True|Yes|错|錯|错误|錯誤|×|否|F|False|No)$/i.test(text));
+            if (judgementWords.length >= 2) return '判断题';
+            return type;
+        }
+
         parseQuestion(question, fallbackOrder = 0) {
             if (!question) return null;
             const titleNode = this.findTitleNode(question);
@@ -847,19 +1092,20 @@
 
             if (!title) {
                 const lines = this.getLines(question);
-                title = lines.find(line => !/^(我的答案|正确答案|答案解析|题目解析|难易度|知识点)/.test(line)) || '';
+                title = lines.find(line => !/^(我的答案|正確答案|正确答案|答案解析|题目解析|難易度|难易度|知识点|知識點)/.test(line)) || '';
             }
             if (!title) return null;
 
             const order = this.extractQuestionNumber(title) ||
                 this.extractQuestionNumber(question.innerText || question.textContent) ||
                 fallbackOrder;
+            const options = this.extractOptions(question);
 
             return {
                 order,
-                type: this.inferQuestionType(title),
+                type: this.inferQuestionTypeFromNode(question, title),
                 question: title,
-                options: this.extractOptions(question),
+                options,
                 answer: this.extractAnswer(question),
                 images: this.extractImages(question),
                 sourceUrl: location.href,
@@ -868,7 +1114,35 @@
 
         detectMode() {
             if (this.hasVuePracticeQuestions()) return 'practice-vue';
-            return this.getQuestionNodes().length > 1 ? 'long-page' : 'paged';
+
+            const nodes = this.getQuestionNodes();
+            const visibleNodes = nodes.filter(node => this.isQuestionNodeVisible(node));
+            const visibleQuestionKeys = new Set();
+            visibleNodes.forEach((node, index) => {
+                const item = this.parseQuestion(node, index + 1);
+                if (!item) return;
+                const key = Number(item.order) > 0
+                    ? `order:${Number(item.order)}`
+                    : `question:${normalizeText(item.question).slice(0, 120)}`;
+                visibleQuestionKeys.add(key);
+            });
+            const visibleQuestionCount = visibleQuestionKeys.size || visibleNodes.length;
+            const navigationNumbers = this.getQuestionNavigationNumbers();
+            const total = this.detectTotal();
+            const hasDirectionalNavigation = Boolean(
+                this.findNavigation('下一题') || this.findNavigation('上一题')
+            );
+
+            // 逐题页面经常会把其他题目的隐藏 DOM、选项容器或答题卡一起放在页面中。
+            // 旧逻辑只要检测到多个节点就误判为“长卷同页”，从而只扫描当前 DOM。
+            // 现在只把“多个不同的可见题目”视为长卷；存在明确翻页控件时优先逐题模式。
+            if (total > 1 && hasDirectionalNavigation) return 'paged';
+            if ((total > 1 || navigationNumbers.length >= 2) && visibleQuestionCount <= 1 && navigationNumbers.length >= 2) {
+                return 'paged';
+            }
+            if (visibleQuestionCount > 1) return 'long-page';
+            if (nodes.length > 1 && !hasDirectionalNavigation && navigationNumbers.length < 2) return 'long-page';
+            return 'paged';
         }
 
         detectTotal() {
@@ -925,10 +1199,13 @@
         }
 
         getCurrentOrder() {
-            const nodes = this.getQuestionNodes();
-            const question = nodes.find(node => this.isQuestionNodeVisible(node)) || nodes[0];
+            const active = this.getActiveQuestionNumber();
+            const navigationNumbers = active > 0 ? this.getQuestionNavigationNumbers() : [];
+            if (active > 0 && navigationNumbers.includes(active)) return active;
+
+            const question = this.getCurrentQuestionNode(active);
             const parsed = question ? this.parseQuestion(question) : null;
-            return Number(parsed?.order) || this.getActiveQuestionNumber() || 0;
+            return Number(parsed?.order) || active || 0;
         }
 
         findTextAction(label, root = document) {
@@ -965,11 +1242,81 @@
         }
 
         findNavigation(label) {
-            return this.findTextAction(label) || null;
+            const aliases = {
+                '下一题': ['下一题', '下题', '后一题', '下一页', '下一步', '下一个'],
+                '上一题': ['上一题', '上题', '前一题', '上一页', '上一个'],
+            };
+            const labels = aliases[label] || [label];
+            for (const candidate of labels) {
+                const action = this.findTextAction(candidate);
+                if (action) return action;
+            }
+
+            // 部分新版页面只在 aria-label/title 中标注翻页含义，按钮正文是图标。
+            const attributePattern = label === '下一题'
+                ? /下一题|下题|后一题|下一页|下一步|下一个|next/i
+                : label === '上一题'
+                    ? /上一题|上题|前一题|上一页|上一个|previous|prev/i
+                    : new RegExp(String(label), 'i');
+            const candidates = Array.from(document.querySelectorAll(
+                'a, button, input[type="button"], input[type="submit"], [role="button"], [onclick]'
+            ));
+            for (const element of candidates) {
+                if (element.closest?.(`#${APP.id}-host`) || !isVisible(element) || isDisabled(element)) continue;
+                const hint = [
+                    element.getAttribute?.('aria-label'),
+                    element.getAttribute?.('title'),
+                    element.getAttribute?.('data-title'),
+                    element.getAttribute?.('name'),
+                    element.getAttribute?.('rel'),
+                    element.id,
+                    element.className,
+                    element.getAttribute?.('onclick'),
+                    element.tagName === 'INPUT' ? element.value : '',
+                ].filter(Boolean).join(' ');
+                if (attributePattern.test(normalizeText(hint))) return element;
+            }
+            return null;
+        }
+
+        findQuestionNavigationTarget(targetOrder, currentOrder = 0) {
+            const target = Number(targetOrder) || 0;
+            const current = Number(currentOrder) || this.getCurrentOrder();
+            if (target > 0) {
+                const direct = this.findNumberButton(target);
+                if (direct) return { element: direct, targetOrder: target, method: 'number' };
+            }
+
+            if (target > current || !(current > 0)) {
+                const next = this.findNavigation('下一题');
+                if (next) return { element: next, targetOrder: target || current + 1, method: 'next' };
+            }
+            if (target > 0 && target < current) {
+                const previous = this.findNavigation('上一题');
+                if (previous) return { element: previous, targetOrder: target, method: 'previous' };
+            }
+
+            // 最后尝试答题卡中当前题之后最近的题号。
+            const later = this.getQuestionNavigationNumbers().find(number => number > current);
+            if (later) {
+                const direct = this.findNumberButton(later);
+                if (direct) return { element: direct, targetOrder: later, method: 'number-fallback' };
+            }
+            return null;
         }
 
         getQuestionNumberCandidates(number = null) {
-            const targetText = number == null ? null : String(number);
+            this.ensureDomObserver();
+            const targetNumber = number == null ? null : Number(number);
+            const now = Date.now();
+            if (
+                this._navigationCandidateCache &&
+                this._navigationCandidateCache.revision === this._domRevision &&
+                now - this._navigationCandidateCache.at <= APP.navigationCacheTtl
+            ) {
+                const cached = this._navigationCandidateCache.candidates;
+                return (targetNumber == null ? cached : cached.filter(candidate => candidate.number === targetNumber)).slice();
+            }
             const selector = [
                 'a', 'button', 'input[type="button"]', 'input[type="submit"]',
                 '[role="button"]', '[onclick]', 'li',
@@ -988,7 +1335,7 @@
                 const text = node.tagName === 'INPUT'
                     ? normalizeText(node.value)
                     : normalizeText(node.innerText || node.textContent);
-                if (!/^\d{1,5}$/.test(text) || (targetText !== null && text !== targetText)) continue;
+                if (!/^\d{1,5}$/.test(text)) continue;
 
                 let element = node;
                 const standardClickable = node.matches?.('a, button, input, [role="button"], [onclick]')
@@ -1028,7 +1375,13 @@
                 result.push({ element, number: Number(text), score });
             }
 
-            return result.sort((left, right) => right.score - left.score);
+            const sorted = result.sort((left, right) => right.score - left.score);
+            this._navigationCandidateCache = {
+                revision: this._domRevision,
+                at: Date.now(),
+                candidates: sorted.slice(),
+            };
+            return (targetNumber == null ? sorted : sorted.filter(candidate => candidate.number === targetNumber)).slice();
         }
 
         getQuestionNavigationNumbers() {
@@ -1053,58 +1406,51 @@
         }
 
         async waitForQuestion(timeout = APP.questionWaitTimeout) {
-            const startedAt = Date.now();
-            while (Date.now() - startedAt < timeout) {
-                const nodes = this.getQuestionNodes();
-                if (nodes.length && normalizeText(nodes[0].textContent)) return nodes[0];
-                await sleep(250);
-            }
-            return null;
+            return this.waitForDomCondition(() => {
+                const node = this.getCurrentQuestionNode();
+                return node && normalizeText(node.textContent) ? node : null;
+            }, { timeout, interval: 90 });
         }
 
         async waitForStableCurrentOrder(timeout = APP.questionWaitTimeout) {
-            const startedAt = Date.now();
             let last = 0;
-            let hits = 0;
-
-            while (Date.now() - startedAt < timeout) {
-                const value = this.getCurrentOrder();
-                if (value > 0) {
-                    if (value === last) hits += 1;
-                    else {
-                        last = value;
-                        hits = 1;
-                    }
-                    if (hits >= 2) return value;
+            let stableSince = 0;
+            const value = await this.waitForDomCondition(() => {
+                const current = this.getCurrentOrder();
+                if (!(current > 0)) return null;
+                if (current !== last) {
+                    last = current;
+                    stableSince = Date.now();
+                    return null;
                 }
-                await sleep(250);
-            }
-            return last;
+                return Date.now() - stableSince >= APP.domSettleDelay ? current : null;
+            }, { timeout, interval: 45 });
+            return Number(value) || last;
         }
 
         async waitForQuestionSwitch(previousSignature = '', targetOrder = 0, timeout = APP.aiNavigationTimeout) {
-            const startedAt = Date.now();
-            let lastSignature = '';
-            let stableHits = 0;
-
-            while (Date.now() - startedAt < timeout) {
+            let readySince = 0;
+            let readyKey = '';
+            const result = await this.waitForDomCondition(() => {
                 const currentOrder = this.getCurrentOrder();
                 const signature = this.getQuestionSignature();
                 const orderMatched = Number(targetOrder) > 0 && currentOrder === Number(targetOrder);
                 const contentChanged = Boolean(signature && previousSignature && signature !== previousSignature);
                 const ready = orderMatched || contentChanged || (!previousSignature && Boolean(signature));
-
-                if (ready) {
-                    if (signature && signature === lastSignature) stableHits += 1;
-                    else {
-                        lastSignature = signature;
-                        stableHits = 1;
-                    }
-                    if (stableHits >= 2) return true;
+                if (!ready) {
+                    readySince = 0;
+                    readyKey = '';
+                    return null;
                 }
-                await sleep(220);
-            }
-            return false;
+                const key = `${currentOrder}|${signature}`;
+                if (key !== readyKey) {
+                    readyKey = key;
+                    readySince = Date.now();
+                    return null;
+                }
+                return Date.now() - readySince >= APP.domSettleDelay ? true : null;
+            }, { timeout, interval: 45 });
+            return Boolean(result);
         }
 
         getPaperTitle() {
@@ -1163,50 +1509,80 @@
                 '[class*="answer"] textarea', '[class*="answer"] input[type="text"]',
                 '[class*="blank"] input[type="text"]', '[class*="editor"] [contenteditable="true"]'
             ].join(',');
-            const result = [];
+            const questionContainerSelector = [
+                '.questionLi', '.mark_item',
+                '.question-item', '.questionItem',
+                '.subject-item', '.subjectItem',
+                '.topic-item', '.topicItem',
+                '.practice-question', '.practiceQuestion',
+                '[data-question-id]', '[data-questionid]',
+                '[data-question-index]', '[data-topic-id]'
+            ].join(',');
             const seen = new Set();
-            const addFrom = (root, allowHidden = false) => {
-                for (const element of Array.from(root?.querySelectorAll?.(selector) || [])) {
-                    if (seen.has(element) || !this.isUsableTextControl(element, allowHidden)) continue;
-                    seen.add(element);
-                    result.push(element);
-                }
-                for (const element of this.getFrameEditorBodies(root)) {
-                    if (!seen.has(element)) {
-                        seen.add(element);
-                        result.push(element);
-                    }
-                }
+            const result = [];
+
+            const addElement = element => {
+                if (!element || seen.has(element) || !this.isUsableTextControl(element)) return;
+                seen.add(element);
+                result.push(element);
+            };
+            const addFrom = root => {
+                for (const element of Array.from(root?.querySelectorAll?.(selector) || [])) addElement(element);
+                for (const element of this.getFrameEditorBodies(root)) addElement(element);
             };
 
-            addFrom(questionNode);
-            if (result.length) return result;
+            // questionNode 有时只是题干或第一个空的局部节点。先回到最近的完整题目容器，
+            // 一次收集该题全部输入框，不能在找到第一个控件后立即返回。
+            const questionScope = questionNode?.matches?.(questionContainerSelector)
+                ? questionNode
+                : questionNode?.closest?.(questionContainerSelector);
+            addFrom(questionScope || questionNode);
 
-            let ancestor = questionNode?.parentElement;
-            for (let depth = 0; ancestor && depth < 3 && ancestor !== document.body; depth += 1, ancestor = ancestor.parentElement) {
-                addFrom(ancestor);
-                if (result.length) return result;
+            if (!questionScope) {
+                // 没有标准题目容器时，逐层扩大范围。若某一层开始包含多个明显题目块，
+                // 只保留与当前题目在同一子块中的控件，避免把下一题的输入框带进来。
+                let ancestor = questionNode?.parentElement;
+                for (let depth = 0; ancestor && depth < 5 && ancestor !== document.body; depth += 1, ancestor = ancestor.parentElement) {
+                    const nestedQuestions = Array.from(ancestor.querySelectorAll(questionContainerSelector));
+                    if (nestedQuestions.length > 1) break;
+                    addFrom(ancestor);
+                }
             }
 
-            // 某些新版页面把富文本编辑器挂在题目容器的同级节点。只选择题目附近、且名称明显像答案区的控件。
-            const questionRect = questionNode?.getBoundingClientRect?.();
+            // 某些新版页面把多个填空框或富文本编辑器挂在题目容器的同级节点。
+            // 用题目矩形和控件提示筛选，并收集所有匹配项，而不是只取第一个。
+            const questionRect = (questionScope || questionNode)?.getBoundingClientRect?.();
             const documentCandidates = Array.from(document.querySelectorAll(selector));
             for (const element of documentCandidates) {
                 if (seen.has(element) || !this.isUsableTextControl(element)) continue;
+
+                const ownerQuestion = element.closest?.(questionContainerSelector);
+                if (questionScope && ownerQuestion && ownerQuestion !== questionScope) continue;
+
                 const hint = `${element.id || ''} ${element.className || ''} ${element.getAttribute?.('name') || ''} ${element.getAttribute?.('placeholder') || ''}`;
-                if (!/answer|blank|editor|content|subject|question|reply|textarea|填空|答案|作答|请输入/i.test(hint)) continue;
+                if (!/answer|blank|editor|content|subject|question|reply|textarea|fill|填空|答案|作答|请输入|第\s*\d+\s*空/i.test(hint)) continue;
                 if (questionRect) {
                     const rect = element.getBoundingClientRect();
-                    const verticallyNear = rect.bottom >= questionRect.top - 80 && rect.top <= questionRect.bottom + 900;
-                    const horizontallyOverlaps = rect.right >= questionRect.left - 80 && rect.left <= questionRect.right + 80;
+                    const verticallyNear = rect.bottom >= questionRect.top - 100 && rect.top <= questionRect.bottom + 900;
+                    const horizontallyOverlaps = rect.right >= questionRect.left - 100 && rect.left <= questionRect.right + 100;
                     if (!verticallyNear || !horizontallyOverlaps) continue;
                 }
-                seen.add(element);
-                result.push(element);
+                addElement(element);
             }
-            return result;
-        }
 
+            // 保持页面中的自然顺序，确保第 N 个答案写入第 N 个空。
+            return result.sort((left, right) => {
+                if (left === right) return 0;
+                if (left.ownerDocument === right.ownerDocument && left.compareDocumentPosition) {
+                    const position = left.compareDocumentPosition(right);
+                    if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+                    if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+                }
+                const leftRect = left.getBoundingClientRect?.() || { top: 0, left: 0 };
+                const rightRect = right.getBoundingClientRect?.() || { top: 0, left: 0 };
+                return leftRect.top - rightRect.top || leftRect.left - rightRect.left;
+            });
+        }
         findAnswerInputs(questionNode) {
             if (!questionNode) {
                 return { radios: [], checkboxes: [], textInputs: [], textareas: [], contentEditables: [], textControls: [] };
@@ -1224,20 +1600,35 @@
             if (!questionNode) return [];
             const selectors = [
                 '.mark_letter li', '.answerList li', '.answer-list li',
-                '.question-options li', '.option-item', '.answer-option',
-                '.optionItem', '.answerItem', '[class*="option-item"]',
-                '[class*="answer-item"]', '[role="radio"]', '[role="checkbox"]',
+                '.question-options li', '.option-list li', '.options li',
+                '.option-item', '.answer-option', '.optionItem', '.answerItem',
+                '[class*="option-item"]', '[class*="answer-item"]',
+                '[role="radio"]', '[role="checkbox"]',
             ];
             const result = [];
             const seen = new Set();
+            const add = element => {
+                if (!element || seen.has(element) || element.closest?.(`#${APP.id}-host`)) return;
+                const text = normalizeText(element.innerText || element.textContent || '');
+                const hasOptionLetter = Boolean(element.querySelector?.('.option-letter, [class*="option-letter"], [class*="optionLetter"]'));
+                const isRoleChoice = element.matches?.('[role="radio"], [role="checkbox"]');
+                const looksLikeOption = hasOptionLetter || isRoleChoice || /^[A-HＡ-Ｈ]\s*[.、．:：)）]?\s*\S+/.test(text);
+                if (!looksLikeOption) return;
+                seen.add(element);
+                result.push(element);
+            };
+
             for (const selector of selectors) {
-                questionNode.querySelectorAll(selector).forEach(element => {
-                    if (!seen.has(element)) {
-                        seen.add(element);
-                        result.push(element);
-                    }
-                });
+                questionNode.querySelectorAll(selector).forEach(add);
             }
+
+            // mobilelearn 新版常见结构：<li><span class="option-letter">A</span><p class="option-result">...</p></li>
+            // 这些 li 没有 option/answer 类，也没有 radio input；只能靠 option-letter 识别。
+            questionNode.querySelectorAll('li').forEach(add);
+            questionNode.querySelectorAll('.option-letter, [class*="option-letter"], [class*="optionLetter"]').forEach(letter => {
+                add(letter.closest?.('li') || letter.parentElement);
+            });
+
             return result;
         }
 
@@ -1257,9 +1648,16 @@
                 : preferredType === 'radio'
                     ? 'input[type="radio"], [role="radio"]'
                     : 'input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]';
-            return optionElement.querySelector(typeSelector) ||
-                optionElement.closest('label, [role="radio"], [role="checkbox"]') ||
-                optionElement;
+            const nestedInput = optionElement.querySelector(typeSelector);
+            if (nestedInput) return nestedInput;
+
+            // mobilelearn 选项没有 input，点击 li 才会触发页面自己的选中逻辑。
+            const mobileLi = optionElement.matches?.('li')
+                ? optionElement
+                : optionElement.closest?.('li');
+            if (mobileLi?.querySelector?.('.option-letter, [class*="option-letter"], [class*="optionLetter"]')) return mobileLi;
+
+            return optionElement.closest('label, [role="radio"], [role="checkbox"]') || optionElement;
         }
 
         getChoiceState(element) {
@@ -1270,12 +1668,35 @@
             const ariaChecked = element.getAttribute?.('aria-checked');
             if (ariaChecked === 'true') return true;
             if (ariaChecked === 'false') return false;
+            const selectedClassPattern = /(^|\s)(checked|selected|select|is-checked|is-selected|active|on|cur|current|choose|chosen)(\s|$)/i;
+            const unselectedClassPattern = /(^|\s)(unchecked|unselected|unselect)(\s|$)/i;
             const className = String(element.className || '');
-            if (/(^|\s)(checked|selected|is-checked|is-selected|active|on)(\s|$)/i.test(className)) return true;
-            if (/(^|\s)(unchecked|unselected)(\s|$)/i.test(className)) return false;
+            if (selectedClassPattern.test(className)) return true;
+            if (unselectedClassPattern.test(className)) return false;
+            const selectedChild = element.querySelector?.('.checked, .selected, .is-checked, .is-selected, .active, .on, .cur, .current, .choose, .chosen');
+            if (selectedChild) return true;
             const nestedInput = element.querySelector?.('input[type="radio"], input[type="checkbox"]');
             if (nestedInput) return Boolean(nestedInput.checked);
             return null;
+        }
+
+        triggerChoiceClick(element) {
+            if (!element) return false;
+            try { element.scrollIntoView?.({ block: 'center', inline: 'nearest' }); } catch { /* ignore */ }
+            const ownerWindow = element.ownerDocument?.defaultView || window;
+            const eventNames = ['pointerdown', 'mousedown', 'touchstart', 'pointerup', 'mouseup', 'touchend', 'click'];
+            for (const name of eventNames) {
+                try {
+                    const event = /^touch/.test(name)
+                        ? new ownerWindow.Event(name, { bubbles: true, cancelable: true, composed: true })
+                        : new ownerWindow.MouseEvent(name, { bubbles: true, cancelable: true, composed: true, view: ownerWindow });
+                    element.dispatchEvent(event);
+                } catch {
+                    try { element.dispatchEvent(new Event(name, { bubbles: true, cancelable: true })); } catch { /* ignore */ }
+                }
+            }
+            try { element.click?.(); } catch { /* some synthetic elements may reject click */ }
+            return true;
         }
 
         setChoiceState(element, desired) {
@@ -1285,7 +1706,7 @@
             if (element instanceof HTMLInputElement && /^(radio|checkbox)$/i.test(element.type)) {
                 if (element.checked === targetState) return true;
 
-                try { element.click(); } catch { /* fallback below */ }
+                try { this.triggerChoiceClick(element); } catch { /* fallback below */ }
                 if (element.checked === targetState) return true;
 
                 const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked')?.set;
@@ -1299,9 +1720,10 @@
             const before = this.getChoiceState(element);
             if (before === targetState) return true;
             if (targetState || before === true) {
-                try { element.click(); } catch { return false; }
+                if (!this.triggerChoiceClick(element)) return false;
             }
             const after = this.getChoiceState(element);
+            // mobilelearn 的 li 选项有时不会暴露 selected class，只能信任页面点击事件。
             return after === targetState || (after === null && targetState);
         }
 
@@ -1333,14 +1755,29 @@
             const result = { true: null, false: null };
             if (!questionNode) return result;
 
+            const truePattern = /^(对|對|正确|正確|√|是|T|True|Yes)$/i;
+            const falsePattern = /^(错|錯|错误|錯誤|×|否|F|False|No)$/i;
             const options = this.getOptionElements(questionNode);
+            const normalizedOptions = [];
             for (const option of options) {
                 const rawText = normalizeText(option.innerText || option.textContent || '');
-                const text = rawText.replace(/^[A-HＡ-Ｈ]\s*[.、．:：)）]?\s*/, '');
+                const text = rawText.replace(/^[A-HＡ-Ｈ]\s*[.、．:：)）]?\s*/, '').trim();
                 const target = this.getChoiceTarget(option, 'radio');
-                if (!target) continue;
-                if (/^(对|正确|√|是|T|True|Yes)$/i.test(text)) result.true = target;
-                else if (/^(错|错误|×|否|F|False|No)$/i.test(text)) result.false = target;
+                if (!target || !text) continue;
+                normalizedOptions.push({ option, text, target });
+                if (truePattern.test(text)) result.true = target;
+                else if (falsePattern.test(text)) result.false = target;
+            }
+
+            // mobilelearn 判断题如果选项文字被富文本包裹，可能只匹配到父 li。
+            // 常规顺序是 A=对/正确，B=错/错误；找不到显式文字时按两个选项兜底。
+            if ((!result.true || !result.false) && normalizedOptions.length === 2) {
+                if (!result.true && truePattern.test(normalizedOptions[0].text)) result.true = normalizedOptions[0].target;
+                if (!result.false && falsePattern.test(normalizedOptions[1].text)) result.false = normalizedOptions[1].target;
+                if (!result.true && !result.false) {
+                    result.true = normalizedOptions[0].target;
+                    result.false = normalizedOptions[1].target;
+                }
             }
 
             const { radios } = this.findAnswerInputs(questionNode);
@@ -1354,24 +1791,38 @@
         fillQuestion(questionNode, answer, type) {
             this.lastFillError = '';
             if (!questionNode || !normalizeText(answer)) return false;
-            const cleanType = normalizeText(type || '');
+            const storedType = normalizeText(type || '');
+            const titleText = normalizeText(this.findTitleNode(questionNode)?.innerText || this.findTitleNode(questionNode)?.textContent || questionNode.innerText || questionNode.textContent || '');
+            const liveType = this.inferQuestionTypeFromNode(questionNode, titleText);
+            const cleanType = liveType && liveType !== '未分类' ? liveType : storedType;
+            const { radios, checkboxes, textInputs, textareas, contentEditables } = this.findAnswerInputs(questionNode);
+            const optionElements = this.getOptionElements(questionNode);
+            const hasBlankInputs = textInputs.length || textareas.length || contentEditables.length || Boolean(questionNode.querySelector?.('input.ofl-ipt'));
+            const hasChoiceOptions = radios.length || checkboxes.length || optionElements.length >= 2;
+            const answerIsJudgement = /^(对|對|正确|正確|√|错|錯|错误|錯誤|×|是|否|T|F|True|False|Yes|No)$/i.test(normalizeText(answer).replace(/[。.!！]/g, ''));
 
-            if (/判断/.test(cleanType)) return this.fillJudgement(questionNode, answer);
+            // 优先相信当前 DOM 的真实控件，而不是旧 session/AI 里缓存的题型。
+            // 例如 mobilelearn 有时第 N 题题型缓存为“单选题”，但当前节点实际是 .ofl-ipt 填空。
+            if (/填空/.test(cleanType) || (hasBlankInputs && !hasChoiceOptions)) return this.fillBlank(questionNode, answer);
+            if (/判断/.test(cleanType) || (answerIsJudgement && optionElements.length <= 2)) return this.fillJudgement(questionNode, answer);
             if (/多选/.test(cleanType)) return this.fillMultipleChoice(questionNode, answer);
             if (/单选/.test(cleanType)) return this.fillSingleChoice(questionNode, answer);
-            if (/填空/.test(cleanType)) return this.fillBlank(questionNode, answer);
             if (/简答|论述|问答|名词解释|解释题|材料分析|案例分析|翻译|写作|计算题/.test(cleanType)) return this.fillEssay(questionNode, answer);
 
-            const { radios, checkboxes, textInputs, textareas, contentEditables } = this.findAnswerInputs(questionNode);
             if (checkboxes.length) return this.fillMultipleChoice(questionNode, answer);
-            if (radios.length) {
-                if (/^(对|正确|√|错|错误|×|是|否)$/i.test(normalizeText(answer))) {
-                    return this.fillJudgement(questionNode, answer);
-                }
-                return this.fillSingleChoice(questionNode, answer);
+            if (radios.length) return answerIsJudgement ? this.fillJudgement(questionNode, answer) : this.fillSingleChoice(questionNode, answer);
+            if (hasBlankInputs) return this.fillBlank(questionNode, answer);
+
+            // 旧 session 里题型可能是“未分类”，但 mobilelearn 单选/多选没有 radio input，
+            // 只能通过 li.option-letter 这种自定义选项来回填。
+            if (optionElements.length >= 2) {
+                const normalizedAnswer = this.normalizeOptionLetter(answer);
+                const letters = Array.from(new Set(Array.from(normalizedAnswer.matchAll(/[A-H]/g), match => match[0])));
+                if (answerIsJudgement) return this.fillJudgement(questionNode, answer);
+                return letters.length > 1 ? this.fillMultipleChoice(questionNode, answer) : this.fillSingleChoice(questionNode, answer);
             }
-            if (textInputs.length) return this.fillBlank(questionNode, answer);
-            if (textareas.length || contentEditables.length) return this.fillEssay(questionNode, answer);
+
+            this.lastFillError = `未识别到可回填控件；当前DOM题型=${cleanType || '未知'}，缓存题型=${storedType || '未知'}`;
             return false;
         }
 
@@ -1401,8 +1852,8 @@
         fillJudgement(questionNode, answer) {
             const judgementMap = this.getJudgementMap(questionNode);
             const text = normalizeText(answer).replace(/[。.!！]/g, '');
-            const isTrue = /^(对|正确|√|是|T|True|yes)$/i.test(text);
-            const isFalse = /^(错|错误|×|否|F|False|no)$/i.test(text);
+            const isTrue = /^(对|對|正确|正確|√|是|T|True|yes)$/i.test(text);
+            const isFalse = /^(错|錯|错误|錯誤|×|否|F|False|no)$/i.test(text);
             if (isTrue && judgementMap.true) return this.setChoiceState(judgementMap.true, true);
             if (isFalse && judgementMap.false) return this.setChoiceState(judgementMap.false, true);
             return false;
@@ -1550,8 +2001,8 @@
             }
 
             try {
-                element.focus?.();
-                const elementWindow = element.ownerDocument?.defaultView || window;
+                const ownerDocument = element.ownerDocument || document;
+                const elementWindow = ownerDocument.defaultView || window;
                 const prototype = elementTag === 'TEXTAREA'
                     ? elementWindow.HTMLTextAreaElement?.prototype
                     : elementWindow.HTMLInputElement?.prototype;
@@ -1559,32 +2010,69 @@
                 const assign = nextValue => {
                     if (setter) setter.call(element, nextValue);
                     else element.value = nextValue;
+                    // mobilelearn 的 .ofl-ipt 有时在提交时读取 attribute，而不只读 property。
+                    try { element.setAttribute('value', nextValue); } catch { /* ignore */ }
                 };
+                const emit = (eventName, init = {}) => {
+                    try {
+                        const Constructor = eventName.startsWith('key') ? elementWindow.KeyboardEvent : elementWindow.Event;
+                        element.dispatchEvent(new Constructor(eventName, { bubbles: true, cancelable: true, composed: true, ...init }));
+                    } catch {
+                        element.dispatchEvent(new Event(eventName, { bubbles: true, cancelable: true }));
+                    }
+                };
+
+                try { element.scrollIntoView?.({ block: 'center', inline: 'nearest' }); } catch { /* ignore */ }
+                element.focus?.();
+                emit('focusin');
+                emit('focus');
+
                 const previousValue = String(element.value || '');
                 element._valueTracker?.setValue?.(previousValue);
 
                 this.dispatchTextEvent(element, 'beforeinput', null, 'deleteContentBackward', true);
                 assign('');
                 this.dispatchTextEvent(element, 'input', null, 'deleteContentBackward');
+                emit('keyup', { key: 'Backspace' });
 
-                // 不触发 paste 事件，按输入事件逐段写入。这样可兼容“禁止粘贴”以及 Vue/React 受控输入框。
-                const chunkSize = targetValue.length > 600 ? 48 : targetValue.length > 160 ? 16 : 1;
+                // 对 mobilelearn 的填空框不要只一次性改 value，而是按字符模拟输入，
+                // 因为它经常用 keyup/input 里的临时值更新内部答案数组。
                 let currentValue = '';
-                for (let index = 0; index < targetValue.length; index += chunkSize) {
-                    const chunk = targetValue.slice(index, index + chunkSize);
-                    this.dispatchTextEvent(element, 'beforeinput', chunk, 'insertText', true);
-                    currentValue += chunk;
+                for (const character of Array.from(targetValue)) {
+                    emit('keydown', { key: character });
+                    emit('keypress', { key: character });
+                    this.dispatchTextEvent(element, 'beforeinput', character, 'insertText', true);
+                    currentValue += character;
                     assign(currentValue);
                     try { element.setSelectionRange?.(currentValue.length, currentValue.length); } catch { /* ignore */ }
-                    this.dispatchTextEvent(element, 'input', chunk, 'insertText');
+                    this.dispatchTextEvent(element, 'input', character, 'insertText');
+                    emit('keyup', { key: character });
                 }
+
+                // 再做一次最终同步，防止受控输入在逐字过程中丢字符。
+                assign(targetValue);
+                this.dispatchTextEvent(element, 'input', targetValue, 'insertText');
                 element.dispatchEvent(new Event('change', { bubbles: true }));
-                element.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Unidentified' }));
-                element.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
-                element.blur?.();
+                try { element.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: targetValue })); } catch { /* ignore */ }
+
+                // 兼容页面内 jQuery/Zepto 监听。没有就静默跳过。
+                try {
+                    const pageWindow = elementWindow || (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
+                    const jq = pageWindow?.jQuery || pageWindow?.$;
+                    if (typeof jq === 'function') {
+                        jq(element).val(targetValue).trigger('input').trigger('keyup').trigger('change').trigger('blur');
+                    }
+                } catch { /* ignore */ }
+
                 this.syncEditorMirror(element, targetValue);
+                emit('blur');
+                emit('focusout');
+                element.blur?.();
 
                 if (String(element.value) === targetValue) return true;
+                // 有些受控输入会在 blur 后把 property 清空，但 attribute/内部状态已被事件写入。
+                // 若 attribute 保留了目标值，也视为写入成功。
+                if (String(element.getAttribute?.('value') || '') === targetValue) return true;
                 this.lastFillError = `文本框写入后只保留了 ${String(element.value || '').length}/${targetValue.length} 个字符`;
                 return false;
             } catch (error) {
@@ -1596,26 +2084,111 @@
         splitBlankAnswers(answer, expectedCount = 1) {
             const text = String(answer ?? '').trim();
             if (!text) return [];
+
+            const cleanPart = value => normalizeText(value)
+                // 只清理“第1空：”“1空：”“空1：”“(1)”这类空位编号。
+                // 旧逻辑把“16”“0.156%”“1/2”这种真正答案开头的数字也删掉，
+                // 导致多空答案被判定为空，最后整串塞进第 1 空。
+                .replace(/^第\s*(?:[一二三四五六七八九十百]+|\d+)\s*空\s*[.、:：)）\]】-]?\s*/, '')
+                .replace(/^(?:[一二三四五六七八九十百]+|\d+)\s*空\s*[.、:：)）\]】-]?\s*/, '')
+                .replace(/^空\s*(?:[一二三四五六七八九十百]+|\d+)\s*[.、:：)）\]】-]?\s*/, '')
+                .replace(/^[（(\[]\s*(?:[一二三四五六七八九十百]+|\d+)\s*[）)\]]\s*/, '')
+                .replace(/^(?:[一二三四五六七八九十百]+|\d+)\s*[、:：)）\]】-]\s*/, '')
+                .replace(/^\d+\s*\.(?!\d)\s*/, '')
+                .replace(/[，,、;；|｜]+\s*$/, '')
+                .trim();
+            const normalizeParts = values => values.map(cleanPart).filter(value => value !== '');
+
             try {
                 const parsed = JSON.parse(text);
-                if (Array.isArray(parsed)) return parsed.map(normalizeText).filter(Boolean);
-                if (Array.isArray(parsed?.answer)) return parsed.answer.map(normalizeText).filter(Boolean);
+                if (Array.isArray(parsed)) return normalizeParts(parsed);
+                if (Array.isArray(parsed?.answer)) return normalizeParts(parsed.answer);
+                if (Array.isArray(parsed?.answers)) return normalizeParts(parsed.answers);
+                // 兼容 {"第1空":"甲","第2空":"乙"} / {"1":"甲","2":"乙"} / {"blank1":"甲"}
+                if (parsed && typeof parsed === 'object') {
+                    const entries = Object.entries(parsed)
+                        .filter(([key, value]) => value != null && /(?:第?\s*\d+\s*空|blank\s*\d+|^\d+$|空\s*\d+)/i.test(String(key)))
+                        .sort(([left], [right]) => {
+                            const ln = Number(String(left).match(/\d+/)?.[0] || 0);
+                            const rn = Number(String(right).match(/\d+/)?.[0] || 0);
+                            return ln - rn;
+                        })
+                        .map(([, value]) => value);
+                    if (entries.length) return normalizeParts(entries);
+                }
             } catch { /* plain text answer */ }
 
-            if (expectedCount <= 1) return [normalizeText(text)];
-            const cleaners = value => normalizeText(value).replace(/^第?\s*\d+\s*空?\s*[.、:：)）-]?\s*/, '');
-            const byPipe = text.split(/\s*\|\s*/).map(cleaners).filter(Boolean);
-            if (byPipe.length >= expectedCount) return byPipe;
-            const byLine = text.split(/\n+/).map(cleaners).filter(Boolean);
-            if (byLine.length >= expectedCount) return byLine;
-            const bySemicolon = text.split(/[;；]/).map(cleaners).filter(Boolean);
-            if (bySemicolon.length >= expectedCount) return bySemicolon;
-            return byPipe.length ? byPipe : [normalizeText(text)];
-        }
+            const labelStrippedText = text
+                .replace(/^\s*(?:最终答案|正确答案|正確答案|参考答案|參考答案|答案|answer)\s*[:：]\s*/i, '')
+                .trim();
 
+            if (expectedCount <= 1) return [normalizeText(labelStrippedText || text)];
+
+            const sourceText = labelStrippedText || text;
+
+            // “第1空：甲；第2空：乙”、"(1)甲 (2)乙" 等带编号格式。
+            const numberedPattern = /(?:(?:第\s*)?(?:[一二三四五六七八九十百]+|\d+)\s*空|空\s*(?:[一二三四五六七八九十百]+|\d+)|[（(\[]\s*(?:[一二三四五六七八九十百]+|\d+)\s*[）)\]])\s*[.、:：)）\]】-]?\s*/g;
+            const numberedMatches = Array.from(sourceText.matchAll(numberedPattern));
+            if (numberedMatches.length >= 2) {
+                const parts = numberedMatches.map((match, index) => {
+                    const start = Number(match.index) + match[0].length;
+                    const end = index + 1 < numberedMatches.length ? Number(numberedMatches[index + 1].index) : sourceText.length;
+                    return sourceText.slice(start, end);
+                });
+                const normalized = normalizeParts(parts);
+                if (normalized.length >= expectedCount) return normalized;
+            }
+
+            const splitCandidates = [
+                // 竖线是最常见的多空答案分隔符，兼容半角 | 和全角 ｜。
+                sourceText.split(/\s*[|｜]\s*/),
+                sourceText.split(/\r?\n+/),
+                sourceText.split(/[;；]+/)
+            ];
+            for (const values of splitCandidates) {
+                const parts = normalizeParts(values);
+                if (parts.length >= expectedCount) return parts;
+            }
+
+            // 对 “1/2 和 1/2”“伴性 和 一” 这类显式连接词做谨慎拆分；
+            // 只有数量刚好等于空数才采用，避免误拆普通短语。
+            for (const separator of [/\s+(?:和|及|与|and)\s+/i, /\s+(?:，|,)\s*/]) {
+                const parts = normalizeParts(sourceText.split(separator));
+                if (parts.length === expectedCount) return parts;
+            }
+
+            // 模型或已采集答案常用逗号、顿号分隔。只有分段数与空数一致时才采用，
+            // 避免把单个答案中的普通逗号误拆开。
+            for (const separator of [/[，,]+/, /[、]+/]) {
+                const parts = normalizeParts(sourceText.split(separator));
+                if (parts.length === expectedCount) return parts;
+            }
+
+            // 兼容“1. 甲 2. 乙”写在同一行的格式。
+            const inlineNumbered = sourceText.split(/\s+(?=(?:第\s*)?(?:\d+|[一二三四五六七八九十百]+)\s*空?\s*[.、:：)）-])/);
+            const inlineParts = normalizeParts(inlineNumbered);
+            if (inlineParts.length >= expectedCount) return inlineParts;
+
+            // 兼容 “甲 乙” 这种只用空格分隔的多空答案。仅在数量刚好时采用，避免误拆长文本。
+            const whitespaceParts = normalizeParts(sourceText.split(/\s+/));
+            if (whitespaceParts.length === expectedCount) return whitespaceParts;
+
+            return [normalizeText(sourceText)];
+        }
         fillBlank(questionNode, answer) {
             const { textInputs, textareas, contentEditables, textControls } = this.findAnswerInputs(questionNode);
-            const inputs = textControls?.length ? textControls : [...textInputs, ...textareas, ...contentEditables];
+            const seen = new Set();
+            const inputs = [];
+            const addInput = input => {
+                if (!input || seen.has(input) || input.closest?.(`#${APP.id}-host`)) return;
+                if (!this.isUsableTextControl(input)) return;
+                seen.add(input);
+                inputs.push(input);
+            };
+            // mobilelearn 填空框就是 .ofl-ipt，无 id/name，必须显式兜底。
+            Array.from(questionNode?.querySelectorAll?.('input.ofl-ipt, input[type="text"].ofl-ipt') || []).forEach(addInput);
+            (textControls?.length ? textControls : [...textInputs, ...textareas, ...contentEditables]).forEach(addInput);
+
             if (!inputs.length) {
                 this.lastFillError = '未识别到填空输入框或富文本编辑器';
                 return false;
@@ -1629,10 +2202,15 @@
             let filled = 0;
             inputs.forEach((input, index) => {
                 const value = parts[index] ?? (inputs.length === 1 ? parts.join('|') : '');
-                if (value && this.setNativeValue(input, value)) filled += 1;
+                if (!value) return;
+                if (this.setNativeValue(input, value)) filled += 1;
             });
             if (filled === inputs.length) return true;
-            this.lastFillError ||= `只成功填写 ${filled}/${inputs.length} 个空`;
+            if (inputs.length > 1 && parts.length < inputs.length) {
+                this.lastFillError = `识别到 ${inputs.length} 个空，但只解析出 ${parts.length} 个答案：${String(answer).slice(0, 80)}`;
+            } else {
+                this.lastFillError ||= `只成功填写 ${filled}/${inputs.length} 个空`;
+            }
             return false;
         }
 
@@ -1707,6 +2285,31 @@
                 session.processedOrders = Array.isArray(session.processedOrders) ? session.processedOrders : [];
                 session.revealAttempts = session.revealAttempts && typeof session.revealAttempts === 'object' ? session.revealAttempts : {};
                 session.jumpAttempts = session.jumpAttempts && typeof session.jumpAttempts === 'object' ? session.jumpAttempts : {};
+
+                // 兼容旧版数据：旧版无答案题只保存在 skipped 中，未进入 items。
+                // 迁移后至少保留题号和题干；新版采集会额外保存题型、选项和图片。
+                for (const skipped of session.skipped) {
+                    const order = Number(skipped?.order) || 0;
+                    const question = normalizeText(skipped?.question || '');
+                    const exists = session.items.some(item => {
+                        if (order > 0 && Number(item?.order) === order) return true;
+                        return !order && question && normalizeText(item?.question || '') === question;
+                    });
+                    if (!exists && (order > 0 || question)) {
+                        session.items.push({
+                            order,
+                            type: '未分类',
+                            question,
+                            options: [],
+                            answer: '',
+                            images: [],
+                            sourceUrl: '',
+                            answerStatus: 'missing',
+                            missingAnswerReason: skipped?.reason || '未读取到正确答案',
+                        });
+                    }
+                }
+                session.items.sort((left, right) => (left.order || 0) - (right.order || 0));
                 return session;
             } catch (error) {
                 console.error('[CXAE] 读取采集进度失败。', error);
@@ -1733,11 +2336,12 @@
         }
 
         stats(session = this.load()) {
-            if (!session) return { answerCount: 0, skippedCount: 0, processedCount: 0, total: 0 };
+            if (!session) return { questionCount: 0, answerCount: 0, skippedCount: 0, processedCount: 0, total: 0 };
             const processed = new Set((session.processedOrders || []).map(Number).filter(value => value > 0));
             session.items.forEach(item => { if (Number(item.order) > 0) processed.add(Number(item.order)); });
             session.skipped.forEach(item => { if (Number(item.order) > 0) processed.add(Number(item.order)); });
             return {
+                questionCount: session.items.filter(item => normalizeText(item.question)).length,
                 answerCount: session.items.filter(item => normalizeText(item.answer)).length,
                 skippedCount: session.skipped.length,
                 processedCount: processed.size,
@@ -1761,22 +2365,53 @@
         }
 
         addItem(session, item) {
-            const itemKey = item.order ? `order:${item.order}` : `question:${item.question}`;
+            const hasAnswer = Boolean(normalizeText(item?.answer));
+            const normalizedItem = {
+                ...item,
+                answer: item?.answer == null ? '' : String(item.answer),
+                answerStatus: hasAnswer ? 'answered' : 'missing',
+            };
+            if (hasAnswer) delete normalizedItem.missingAnswerReason;
+
+            const itemKey = normalizedItem.order
+                ? `order:${normalizedItem.order}`
+                : `question:${normalizedItem.question}`;
             const index = session.items.findIndex(existing => {
                 const existingKey = existing.order ? `order:${existing.order}` : `question:${existing.question}`;
                 return existingKey === itemKey;
             });
-            if (index >= 0) session.items[index] = item;
-            else session.items.push(item);
+            if (index >= 0) session.items[index] = normalizedItem;
+            else session.items.push(normalizedItem);
             session.items.sort((left, right) => (left.order || 0) - (right.order || 0));
-            session.skipped = session.skipped.filter(record => Number(record.order) !== Number(item.order));
-            this.markProcessed(session, item.order);
+
+            // 后续重新采集到答案时，自动移除原来的“暂无答案”记录。
+            if (hasAnswer) {
+                session.skipped = session.skipped.filter(record => {
+                    if (Number(normalizedItem.order) > 0) return Number(record.order) !== Number(normalizedItem.order);
+                    return normalizeText(record.question) !== normalizeText(normalizedItem.question);
+                });
+            }
+            this.markProcessed(session, normalizedItem.order);
         }
 
         addSkipped(session, item, reason) {
             const order = Number(item?.order) || 0;
-            const record = { order, question: item?.question || '', reason: reason || '未读取到正确答案' };
-            const index = session.skipped.findIndex(existing => order > 0 && Number(existing.order) === order);
+            const missingReason = reason || '未读取到正确答案';
+
+            // 无答案也要保存完整题目；skipped 仅用于记录“暂无答案”的状态和原因。
+            this.addItem(session, {
+                ...(item || {}),
+                order,
+                answer: '',
+                answerStatus: 'missing',
+                missingAnswerReason: missingReason,
+            });
+
+            const record = { order, question: item?.question || '', reason: missingReason };
+            const index = session.skipped.findIndex(existing => {
+                if (order > 0) return Number(existing.order) === order;
+                return normalizeText(existing.question) === normalizeText(record.question);
+            });
             if (index >= 0) session.skipped[index] = record;
             else session.skipped.push(record);
             this.markProcessed(session, order);
@@ -1798,7 +2433,7 @@
         getItems() {
             const session = this.store.load();
             return (session?.items || [])
-                .filter(item => normalizeText(item.answer))
+                .filter(item => normalizeText(item.question))
                 .slice()
                 .sort((left, right) => (left.order || 0) - (right.order || 0));
         }
@@ -1812,7 +2447,7 @@
 
         exportExcel() {
             const items = this.getItems();
-            if (!items.length) throw new Error('没有可导出的正确答案');
+            if (!items.length) throw new Error('没有可导出的题目');
             if (typeof XLSX === 'undefined') throw new Error('Excel 组件尚未加载，请检查网络后刷新页面');
 
             const rows = items.map(item => ({
@@ -1820,7 +2455,9 @@
                 '题型': item.type || '未分类',
                 '题目': item.question,
                 '选项': (item.options || []).join('\n'),
-                '正确答案': item.answer,
+                '正确答案': item.answer || '',
+                '采集状态': normalizeText(item.answer) ? '已获取答案' : '暂无答案',
+                '备注': item.missingAnswerReason || '',
                 '图片链接': (item.images || []).join('\n'),
             }));
 
@@ -1831,6 +2468,8 @@
                 { wch: 60 },
                 { wch: 45 },
                 { wch: 22 },
+                { wch: 14 },
+                { wch: 30 },
                 { wch: 45 },
             ];
             worksheet['!rows'] = rows.map(() => ({ hpt: 42 }));
@@ -1843,12 +2482,15 @@
         exportJson() {
             const session = this.store.load();
             const items = this.getItems();
-            if (!items.length) throw new Error('没有可导出的正确答案');
+            if (!items.length) throw new Error('没有可导出的题目');
+            const answered = items.filter(item => normalizeText(item.answer)).length;
             const payload = {
                 title: session?.paperTitle || '超星题目',
                 exportedAt: new Date().toISOString(),
                 total: session?.total || items.length,
                 collected: items.length,
+                answered,
+                unanswered: items.length - answered,
                 questions: items,
             };
             downloadBlob(JSON.stringify(payload, null, 2), `${this.baseFilename()}.json`, 'application/json;charset=utf-8');
@@ -1857,7 +2499,7 @@
         exportMarkdown() {
             const session = this.store.load();
             const items = this.getItems();
-            if (!items.length) throw new Error('没有可导出的正确答案');
+            if (!items.length) throw new Error('没有可导出的题目');
 
             const lines = [`# ${session?.paperTitle || '超星题目'}`, ''];
             items.forEach(item => {
@@ -1866,7 +2508,12 @@
                 if (item.options?.length) {
                     lines.push('', ...item.options.map(option => `- ${option}`));
                 }
-                lines.push('', `**正确答案：${item.answer}**`, '');
+                const answerText = normalizeText(item.answer) || '未获取';
+                lines.push('', `**正确答案：${answerText}**`);
+                if (!normalizeText(item.answer) && item.missingAnswerReason) {
+                    lines.push(`- 备注：${item.missingAnswerReason}`);
+                }
+                lines.push('');
                 if (item.images?.length) {
                     lines.push(...item.images.map(url => `- 图片：${url}`), '');
                 }
@@ -1922,6 +2569,7 @@ ${optionsText}`;
             let apiBase = normalizeText(settings.aiApiBase || 'https://api.deepseek.com');
             const apiKey = normalizeText(settings.aiApiKey || '');
             let model = normalizeText(settings.aiModel || 'deepseek-v4-flash');
+            const aiThinkingEnabled = Boolean(settings.aiThinkingEnabled);
 
             if (!apiKey) throw new Error('未配置 AI API Key，请在设置中填写');
             if (!/^https?:\/\//i.test(apiBase)) throw new Error('AI API 地址格式不正确');
@@ -1945,7 +2593,7 @@ ${optionsText}`;
                 ? normalizedBase
                 : `${normalizedBase}/chat/completions`;
 
-            return { apiKey, model, url, isOfficialDeepSeek };
+            return { apiKey, model, url, isOfficialDeepSeek, aiThinkingEnabled };
         }
 
         normalizeMessageContent(value) {
@@ -1971,10 +2619,13 @@ ${optionsText}`;
                 max_tokens: 2048,
             };
 
-            // DeepSeek V4 默认可能进入思考模式。答题只需要简短最终答案，关闭思考可避免
-            // 输出额度被 reasoning_content 消耗后 content 为空。
+            // DeepSeek V4 支持 thinking 参数。默认关闭，保证答题速度和最终答案稳定；
+            // 在设置中打开后，会请求模型进入思考模式，但仍要求最终只输出答案。
             if (provider.isOfficialDeepSeek && /^deepseek-v4-/i.test(provider.model)) {
-                payload.thinking = { type: 'disabled' };
+                payload.thinking = { type: provider.aiThinkingEnabled ? 'enabled' : 'disabled' };
+                if (provider.aiThinkingEnabled) {
+                    payload.max_tokens = Math.max(payload.max_tokens, 4096);
+                }
             }
             if (jsonMode) payload.response_format = { type: 'json_object' };
 
@@ -2107,10 +2758,15 @@ ${optionsText}`;
                 .trim();
             if (!text) return { answer: '', confidence: 0 };
 
+            const cleanType = normalizeText(expectedType || '');
             const normalizeAnswer = value => {
-                if (Array.isArray(value)) return value.map(normalizeText).filter(Boolean).join(',');
+                if (Array.isArray(value)) {
+                    const separator = /填空/.test(cleanType) ? '|' : ',';
+                    return value.map(normalizeText).filter(Boolean).join(separator);
+                }
                 if (value && typeof value === 'object') {
-                    return normalizeText(value.answer ?? value.value ?? value.content ?? '');
+                    const nested = value.answer ?? value.answers ?? value.value ?? value.content ?? '';
+                    return normalizeAnswer(nested);
                 }
                 return normalizeText(value ?? '');
             };
@@ -2125,7 +2781,9 @@ ${optionsText}`;
             for (const candidate of candidates) {
                 try {
                     const parsed = JSON.parse(candidate);
-                    const answer = normalizeAnswer(parsed?.answer ?? parsed?.result ?? parsed?.response);
+                    const answer = normalizeAnswer(
+                        Array.isArray(parsed) ? parsed : (parsed?.answer ?? parsed?.answers ?? parsed?.result ?? parsed?.response)
+                    );
                     if (answer) {
                         return {
                             answer,
@@ -2162,7 +2820,6 @@ ${optionsText}`;
                 }
             }
 
-            const cleanType = normalizeText(expectedType || '');
             if (/单选/.test(cleanType)) {
                 const match = text.match(/(?:最终答案|正确答案|答案|answer|选项)?\s*[:：为是]?\s*\b([A-H])\b(?!\s*[,，、]\s*[A-H])/i);
                 if (match?.[1]) return { answer: match[1].toUpperCase(), confidence: 0.4 };
@@ -2403,10 +3060,11 @@ ${optionsText}`;
                     );
 
                     try {
+                        const liveItem = this.adapter.parseQuestion(node, Number(item.order) || index + 1) || item;
                         const result = await this.aiClient.answerQuestion({
-                            type: item.type,
-                            question: item.question,
-                            options: item.options,
+                            type: liveItem.type || item.type,
+                            question: liveItem.question || item.question,
+                            options: liveItem.options?.length ? liveItem.options : item.options,
                         });
 
                         if (!normalizeText(result.answer)) {
@@ -2421,7 +3079,7 @@ ${optionsText}`;
                             );
                         } else {
                             failed += 1;
-                            lastError = `答案“${result.answer}”未能匹配页面控件`;
+                            lastError = `答案“${result.answer}”未能匹配页面控件${this.adapter.lastFillError ? `（${this.adapter.lastFillError}）` : ''}`;
                             console.warn(
                                 `[CXAE] AI答题 第${index + 1}题 填充失败：答案=${result.answer}，题型=${item.type}`
                             );
@@ -2593,10 +3251,11 @@ ${optionsText}`;
 
                     const item = { ...target.item, order };
                     try {
+                        const liveItem = this.adapter.parseQuestion(target.node, order) || item;
                         const result = await this.aiClient.answerQuestion({
-                            type: item.type,
-                            question: item.question,
-                            options: item.options,
+                            type: liveItem.type || item.type,
+                            question: liveItem.question || item.question,
+                            options: liveItem.options?.length ? liveItem.options : item.options,
                         });
                         if (!normalizeText(result.answer)) {
                             task.failed += 1;
@@ -2864,7 +3523,7 @@ ${optionsText}`;
                 </button>
                 <section class="panel" role="dialog" aria-label="${APP.name}">
                     <header class="header">
-                        <div class="logo">答</div>
+                        <div class="logo">学</div>
                         <div class="heading">
                             <h2 class="title">${APP.name}</h2>
                             <div class="subtitle" data-role="paper-title">等待识别试卷</div>
@@ -2874,14 +3533,14 @@ ${optionsText}`;
                     <main class="content">
                         <div class="mode-row">
                             <span class="badge" data-role="mode">等待题目</span>
-                            <span class="scope" data-role="scope">仅保存题目与正确答案</span>
+                            <span class="scope" data-role="scope">保存全部题目与可用答案</span>
                         </div>
 
                         <section class="card">
                             <div class="stats">
                                 <div class="stat"><span class="stat-value" data-stat="answers">0</span><span class="stat-label">已获答案</span></div>
                                 <div class="stat"><span class="stat-value" data-stat="processed">0</span><span class="stat-label">已处理</span></div>
-                                <div class="stat"><span class="stat-value" data-stat="skipped">0</span><span class="stat-label">跳过</span></div>
+                                <div class="stat"><span class="stat-value" data-stat="skipped">0</span><span class="stat-label">暂无答案</span></div>
                                 <div class="stat"><span class="stat-value" data-stat="total">—</span><span class="stat-label">总题数</span></div>
                             </div>
                             <div class="progress"><div data-role="progress-bar"></div></div>
@@ -2893,7 +3552,7 @@ ${optionsText}`;
                             <h3 class="section-title">采集</h3>
                             <div class="grid">
                                 <button class="button primary full" type="button" data-action="start">开始 / 继续采集</button>
-                                <button class="button" type="button" data-action="scan">扫描当前页</button>
+                                <button class="button" type="button" data-action="scan">仅扫描当前页</button>
                                 <button class="button" type="button" data-action="pause">暂停并保存</button>
                             </div>
                         </section>
@@ -2915,6 +3574,23 @@ ${optionsText}`;
                                 <button class="button" type="button" data-action="stop-fill">停止答题</button>
                             </div>
                             <div class="ai-status" data-role="ai-status">支持当前页和逐题换页；换页试卷会按题号自动作答并保存进度</div>
+                        </section>
+
+                        <section class="card">
+                            <h3 class="section-title">自动刷课</h3>
+                            <div class="settings">
+                                <label class="setting"><span>启用自动刷课</span><span class="switch"><input type="checkbox" data-study-setting="enabled"><span></span></span></label>
+                                <label class="setting"><span>自动播放视频</span><span class="switch"><input type="checkbox" data-study-setting="autoplay"><span></span></span></label>
+                                <label class="setting"><span>AI 做章节测验</span><span class="switch"><input type="checkbox" data-study-setting="solveQuizWithAi"><span></span></span></label>
+                                <label class="setting"><span>自动提交测验</span><span class="switch"><input type="checkbox" data-study-setting="autoSubmitQuiz"><span></span></span></label>
+                                <label class="setting"><span>找不到视频时跳过</span><span class="switch"><input type="checkbox" data-study-setting="skipQuiz"><span></span></span></label>
+                                <label class="setting"><span>倍速</span><input class="input-field" type="number" data-study-setting="playbackRate" min="0.5" max="16" step="0.1" style="width: 96px;"></label>
+                            </div>
+                            <div class="grid" style="margin-top: 10px;">
+                                <button class="button" type="button" data-study-action="start">立即启动</button>
+                                <button class="button" type="button" data-study-action="stop">暂停</button>
+                            </div>
+                            <div class="ai-status" data-role="study-status">自动刷课控制已合并到本面板；关闭“找不到视频时跳过”后会优先尝试 AI 做测验</div>
                         </section>
 
                         <section class="card">
@@ -2942,9 +3618,16 @@ ${optionsText}`;
                                     </div>
                                     <button class="btn-sm" type="button" data-action="test-ai">测试连接</button>
                                 </div>
+                                <div class="settings" style="margin-top: 8px;">
+                                    <label class="setting"><span>DeepSeek V4 打开思考（更慢、更耗额度）</span><span class="switch"><input type="checkbox" data-setting="aiThinkingEnabled"><span></span></span></label>
+                                </div>
                                 <div style="margin-top: 4px;">
                                     <label class="input-label">填充间隔（毫秒）</label>
                                     <input class="input-field" type="number" data-setting="autoFillDelay" placeholder="500" min="200" max="5000" style="width: 120px;">
+                                </div>
+                                <div style="margin-top: 8px;">
+                                    <label class="input-label">采集翻页间隔（毫秒）</label>
+                                    <input class="input-field" type="number" data-setting="collectionDelay" placeholder="120" min="0" max="2000" style="width: 120px;">
                                 </div>
                             </div>
                         </section>
@@ -3003,6 +3686,110 @@ ${optionsText}`;
                     });
                 }
             });
+            this.bindStudyControls();
+        }
+
+        studyDefaults() {
+            return {
+                enabled: true,
+                playbackRate: 1.5,
+                autoplay: true,
+                skipQuiz: false,
+                solveQuizWithAi: true,
+                autoSubmitQuiz: true,
+            };
+        }
+
+        loadStudySettings() {
+            try {
+                const parsed = JSON.parse(localStorage.getItem('CX_STUDY_AUTOPLAYER_SETTINGS') || '{}');
+                return { ...this.studyDefaults(), ...parsed };
+            } catch {
+                return { ...this.studyDefaults() };
+            }
+        }
+
+        saveStudySettings(settings) {
+            const merged = { ...this.studyDefaults(), ...(settings || {}) };
+            try {
+                const existing = JSON.parse(localStorage.getItem('CX_STUDY_AUTOPLAYER_SETTINGS') || '{}');
+                localStorage.setItem('CX_STUDY_AUTOPLAYER_SETTINGS', JSON.stringify({ ...existing, ...merged }));
+            } catch {
+                localStorage.setItem('CX_STUDY_AUTOPLAYER_SETTINGS', JSON.stringify(merged));
+            }
+            return merged;
+        }
+
+        getStudyPlayer() {
+            return window.cxStudyAutoPlayer || window['cx-study-autoplayer'] || null;
+        }
+
+        bindStudyControls() {
+            this.shadow.querySelectorAll('[data-study-setting]').forEach(input => {
+                input.addEventListener('change', () => {
+                    const key = input.dataset.studySetting;
+                    const value = input.type === 'checkbox' ? Boolean(input.checked) : Number(input.value);
+                    this.updateStudySettings({ [key]: value });
+                });
+            });
+            this.shadow.querySelectorAll('[data-study-action]').forEach(button => {
+                button.addEventListener('click', () => {
+                    const action = button.dataset.studyAction;
+                    if (action === 'start') {
+                        this.updateStudySettings({ enabled: true });
+                        const player = this.getStudyPlayer();
+                        if (player?.start) {
+                            player.start();
+                            this.setStudyStatus('自动刷课已启动', 'active');
+                        } else {
+                            this.setStudyStatus('已保存开启状态；请确认当前是课程学习页', 'active');
+                        }
+                    } else if (action === 'stop') {
+                        this.updateStudySettings({ enabled: false });
+                        this.setStudyStatus('自动刷课已暂停', 'normal');
+                    }
+                });
+            });
+        }
+
+        updateStudySettings(patch = {}) {
+            const settings = this.saveStudySettings({ ...this.loadStudySettings(), ...patch });
+            const player = this.getStudyPlayer();
+            if (player?._updateSettings) {
+                player._updateSettings(patch);
+            } else {
+                try {
+                    window.dispatchEvent(new CustomEvent('cx-study-autoplayer-settings', { detail: settings }));
+                } catch {}
+            }
+            this.applyStudySettings();
+            this.setStudyStatus(settings.enabled ? '自动刷课已开启' : '自动刷课已关闭', settings.enabled ? 'active' : 'normal');
+        }
+
+        applyStudySettings() {
+            const settings = this.loadStudySettings();
+            this.shadow?.querySelectorAll('[data-study-setting]').forEach(input => {
+                const key = input.dataset.studySetting;
+                const value = settings[key];
+                if (input.type === 'checkbox') input.checked = Boolean(value);
+                else input.value = value ?? '';
+            });
+            const isStudyPage = /\/mycourse\/studentstudy/i.test(location.href);
+            const player = this.getStudyPlayer();
+            if (!isStudyPage) {
+                this.setStudyStatus('自动刷课只在课程学习页生效；设置会保存在本浏览器', 'normal');
+            } else if (player) {
+                this.setStudyStatus(settings.enabled ? '自动刷课模块已连接' : '自动刷课模块已关闭', settings.enabled ? 'active' : 'normal');
+            } else {
+                this.setStudyStatus('等待自动刷课模块加载…', 'normal');
+            }
+        }
+
+        setStudyStatus(text, tone = 'normal') {
+            const node = this.$('[data-role="study-status"]');
+            if (!node) return;
+            node.textContent = text;
+            node.dataset.tone = tone;
         }
 
         on(action, handler) {
@@ -3022,6 +3809,7 @@ ${optionsText}`;
                     }
                 }
             });
+            this.applyStudySettings();
         }
 
         toggle() {
@@ -3089,13 +3877,13 @@ ${optionsText}`;
             startButton.disabled = Boolean(session?.active);
             startButton.textContent = session?.items?.length || session?.skipped?.length ? '继续采集' : '开始采集';
             pauseButton.disabled = !session?.active;
-            exportButtons.filter(Boolean).forEach(button => { button.disabled = stats.answerCount === 0; });
+            exportButtons.filter(Boolean).forEach(button => { button.disabled = stats.questionCount === 0; });
 
             const skippedList = this.$('[data-role="skipped-list"]');
             const recent = (session?.skipped || []).slice(-4).reverse();
             skippedList.classList.toggle('visible', recent.length > 0);
             skippedList.innerHTML = recent.length
-                ? `<strong>最近跳过</strong>${recent.map(item => `<div class="skipped-item">第 ${item.order || '?'} 题：${this.escape(item.reason)}</div>`).join('')}`
+                ? `<strong>最近暂无答案</strong>${recent.map(item => `<div class="skipped-item">第 ${item.order || '?'} 题：${this.escape(item.reason)}</div>`).join('')}`
                 : '';
 
             if (session?.active) {
@@ -3211,7 +3999,7 @@ ${optionsText}`;
         clear() {
             const session = this.store.load();
             const stats = this.store.stats(session);
-            if ((stats.answerCount || stats.skippedCount) && !confirm(`将清空当前试卷的 ${stats.answerCount} 个答案和 ${stats.skippedCount} 条跳过记录，是否继续？`)) return;
+            if ((stats.answerCount || stats.skippedCount) && !confirm(`将清空当前试卷的 ${stats.questionCount} 道题（其中 ${stats.answerCount} 道有答案、${stats.skippedCount} 道暂无答案），是否继续？`)) return;
             this.store.clear();
             this.ui.refresh();
             this.ui.setStatus('已清空当前试卷数据', 'normal');
@@ -3226,7 +4014,7 @@ ${optionsText}`;
             this.store.save(session);
             this.ui.refresh();
             const stats = this.store.stats(session);
-            if (phase === 'completed') this.ui.setStatus(`采集完成：${stats.answerCount} 个正确答案，跳过 ${stats.skippedCount} 题`, 'success');
+            if (phase === 'completed') this.ui.setStatus(`采集完成：共采集 ${stats.questionCount} 道题，其中 ${stats.answerCount} 道有答案，${stats.skippedCount} 道暂无答案`, 'success');
             else if (phase === 'error') this.ui.setStatus(message || '采集失败', 'error');
             else this.ui.setStatus(message || '采集已暂停', 'normal');
         }
@@ -3258,7 +4046,7 @@ ${optionsText}`;
                 this.store.save(session);
                 this.ui.refresh();
                 const stats = this.store.stats(session);
-                this.ui.setStatus(`当前页扫描完成：获取 ${stats.answerCount} 个正确答案`, 'success');
+                this.ui.setStatus(`当前页扫描完成：共采集 ${stats.questionCount} 道题，其中 ${stats.answerCount} 道有答案；整卷请点击“开始 / 继续采集”`, 'success');
             } catch (error) {
                 this.ui.setStatus(error.message || '扫描当前页失败', 'error');
             } finally {
@@ -3304,7 +4092,7 @@ ${optionsText}`;
             let lastCount = 0;
             let stableRounds = 0;
 
-            for (let round = 0; round < 18 && stableRounds < 3; round += 1) {
+            for (let round = 0; round < 20 && stableRounds < 2; round += 1) {
                 const count = this.adapter.getQuestionNodes().length;
                 if (count === lastCount) stableRounds += 1;
                 else {
@@ -3312,10 +4100,10 @@ ${optionsText}`;
                     stableRounds = 0;
                 }
                 window.scrollTo(0, document.documentElement.scrollHeight);
-                await sleep(350);
+                await sleep(180);
             }
             window.scrollTo(originalX, originalY);
-            await sleep(200);
+            await sleep(100);
         }
 
         async collectLongPage() {
@@ -3342,11 +4130,8 @@ ${optionsText}`;
                     if (!item) continue;
 
                     if (!item.answer) {
-                        for (let wait = 0; wait < 6; wait += 1) {
-                            await sleep(180);
-                            item = this.adapter.parseQuestion(node, index + 1) || item;
-                            if (item.answer) break;
-                        }
+                        const loaded = await this.adapter.waitForAnswer(node, item.order || index + 1, APP.answerGraceTimeout);
+                        if (loaded?.item) item = loaded.item;
                     }
 
                     const settings = this.settingsStore.load();
@@ -3354,11 +4139,8 @@ ${optionsText}`;
                         const reveal = this.adapter.findShowAnswer(node);
                         if (reveal && this.adapter.isSafeInlineReveal(reveal)) {
                             reveal.click();
-                            for (let wait = 0; wait < 15; wait += 1) {
-                                await sleep(220);
-                                item = this.adapter.parseQuestion(node, index + 1) || item;
-                                if (item.answer) break;
-                            }
+                            const revealed = await this.adapter.waitForAnswer(node, item.order || index + 1, APP.answerRevealTimeout);
+                            if (revealed?.item) item = revealed.item;
                         }
                     }
 
@@ -3415,20 +4197,42 @@ ${optionsText}`;
             }
 
             const oldHref = location.href;
+            const previousSignature = this.adapter.getQuestionSignature();
+            const previousOrder = this.adapter.getCurrentOrder();
+            const targetOrder = Number(session.targetOrder) || 0;
+            const settings = this.settingsStore.load();
+            const delay = clampNumber(settings.collectionDelay, 0, 2000, APP.navigationDelay);
+            const revealing = /^reveal-answer-/.test(action);
+
             setTimeout(() => {
                 try {
+                    element.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
                     element.click();
                 } catch (error) {
                     const href = element.href || element.getAttribute?.('href');
-                    if (href && !/^javascript:/i.test(href)) location.assign(href);
-                    else console.error('[CXAE] 点击导航失败。', error);
+                    if (href && !/^javascript:/i.test(href)) {
+                        location.assign(href);
+                        return;
+                    }
+                    console.error('[CXAE] 点击导航失败。', error);
                 }
 
-                setTimeout(() => {
+                // 同页切题不再固定等待 1.6 秒；题号、题干或答案一发生变化就继续。
+                (async () => {
+                    if (revealing) {
+                        const node = this.adapter.getCurrentQuestionNode(previousOrder);
+                        await this.adapter.waitForAnswer(node, previousOrder, APP.answerRevealTimeout);
+                    } else {
+                        await this.adapter.waitForQuestionSwitch(
+                            previousSignature,
+                            targetOrder,
+                            APP.aiNavigationTimeout
+                        );
+                    }
                     const latest = this.store.load();
                     if (latest?.active && location.href === oldHref) this.resume();
-                }, 1600);
-            }, APP.navigationDelay);
+                })();
+            }, delay);
             return true;
         }
 
@@ -3446,23 +4250,21 @@ ${optionsText}`;
                 return false;
             }
 
-            const direct = this.adapter.findNumberButton(target);
-            if (direct) {
-                session.phase = 'resuming';
-                session.targetOrder = target;
-                this.ui.setStatus(`正在从第 ${current} 题跳转到第 ${target} 题…`, 'active');
-                return this.navigate(direct, session, `跳转第${current}到第${target}题`);
-            }
-
-            const label = current < target ? '下一题' : '上一题';
-            const button = this.adapter.findNavigation(label);
-            if (!button) {
-                this.finish(session, 'error', `无法找到"${label}"按钮以恢复到第 ${target} 题`);
+            const navigation = this.adapter.findQuestionNavigationTarget(target, current);
+            if (!navigation?.element) {
+                const label = current < target ? '下一题' : '上一题';
+                this.finish(session, 'error', `已识别到第 ${target} 题，但无法找到题号按钮或“${label}”控件`);
                 return false;
             }
+
             session.phase = 'resuming';
             session.targetOrder = target;
-            return this.navigate(button, session, `恢复-${current}-${label}-${target}`);
+            this.ui.setStatus(`正在从第 ${current} 题跳转到第 ${target} 题…`, 'active');
+            return this.navigate(
+                navigation.element,
+                session,
+                `恢复-${current}-${navigation.method}-${target}`
+            );
         }
 
         async resume() {
@@ -3492,9 +4294,10 @@ ${optionsText}`;
                 }
 
                 const currentOrder = await this.adapter.waitForStableCurrentOrder(6000);
-                let item = this.adapter.parseQuestion(this.adapter.getQuestionNodes()[0], currentOrder || 0);
+                let currentNode = this.adapter.getCurrentQuestionNode(currentOrder);
+                let item = this.adapter.parseQuestion(currentNode, currentOrder || 0);
                 if (!item) {
-                    this.finish(session, 'error', '当前题目解析失败');
+                    this.finish(session, 'error', '当前可见题目解析失败');
                     return;
                 }
                 item.order ||= currentOrder;
@@ -3503,16 +4306,22 @@ ${optionsText}`;
                     return;
                 }
 
+                const isWaitingForReveal = session.phase === 'revealing' &&
+                    Number(session.pendingAnswerOrder) === Number(item.order);
                 if (!item.answer) {
-                    for (let wait = 0; wait < 10; wait += 1) {
-                        await sleep(250);
-                        item = this.adapter.parseQuestion(this.adapter.getQuestionNodes()[0], item.order) || item;
-                        if (item.answer) break;
+                    const loaded = await this.adapter.waitForAnswer(
+                        currentNode,
+                        item.order,
+                        isWaitingForReveal ? APP.answerRevealTimeout : APP.answerGraceTimeout
+                    );
+                    if (loaded?.item) {
+                        currentNode = loaded.node || currentNode;
+                        item = loaded.item;
                     }
                 }
 
                 const settings = this.settingsStore.load();
-                if (!item.answer && settings.autoRevealAnswer) {
+                if (!item.answer && settings.autoRevealAnswer && !isWaitingForReveal) {
                     const reveal = this.adapter.findShowAnswer();
                     const attempts = Number(session.revealAttempts[item.order] || 0);
                     if (reveal && attempts < APP.maxRevealAttempts) {
@@ -3522,14 +4331,6 @@ ${optionsText}`;
                         this.ui.setStatus(`第 ${item.order} 题未显示答案，正在点击"显示答案"…`, 'active');
                         this.navigate(reveal, session, `reveal-answer-${item.order}`);
                         return;
-                    }
-                }
-
-                if (!item.answer && session.phase === 'revealing' && Number(session.pendingAnswerOrder) === Number(item.order)) {
-                    for (let wait = 0; wait < 15; wait += 1) {
-                        await sleep(250);
-                        item = this.adapter.parseQuestion(this.adapter.getQuestionNodes()[0], item.order) || item;
-                        if (item.answer) break;
                     }
                 }
 
@@ -3554,12 +4355,31 @@ ${optionsText}`;
                     return;
                 }
 
-                const next = this.adapter.findNavigation('下一题');
-                if (!next) {
+                const nextOrder = this.store.firstMissing(session);
+                if (session.total && nextOrder > session.total) {
                     this.finish(session, 'completed');
                     return;
                 }
-                this.navigate(next, session, `next-from${item.order}-to${item.order + 1}`);
+
+                const navigation = this.adapter.findQuestionNavigationTarget(nextOrder, item.order);
+                if (!navigation?.element) {
+                    session.active = false;
+                    session.phase = 'paused';
+                    session.targetOrder = nextOrder;
+                    session.message = `已采集第 ${item.order} 题，但检测到共 ${session.total || '?'} 题，无法找到第 ${nextOrder} 题的题号按钮或下一题控件`;
+                    this.store.save(session);
+                    this.ui.refresh();
+                    this.ui.setStatus(session.message, 'error');
+                    return;
+                }
+
+                session.phase = 'resuming';
+                session.targetOrder = nextOrder;
+                this.navigate(
+                    navigation.element,
+                    session,
+                    `next-from${item.order}-${navigation.method}-to${nextOrder}`
+                );
             } catch (error) {
                 session = this.store.load() || session;
                 this.finish(session, 'error', error.message || '跨页面采集失败');
@@ -3572,7 +4392,7 @@ ${optionsText}`;
             clearTimeout(this.resumeTimer);
             const session = this.store.load();
             if (session?.active && session.mode === 'paged') {
-                this.resumeTimer = setTimeout(() => this.resume(), 1100);
+                this.resumeTimer = setTimeout(() => this.resume(), 250);
             }
         }
     }
@@ -3622,7 +4442,8 @@ ${optionsText}`;
     }
 
     function mount() {
-        if (!adapter.hasQuestions()) return false;
+        const isStudyTopPage = window.top === window && /\/mycourse\/studentstudy/i.test(location.href);
+        if (!adapter.hasQuestions() && !isStudyTopPage) return false;
         ui.mount();
         ui.on('start', () => collector.start());
         ui.on('scan', () => collector.scanCurrentPage());
@@ -3664,6 +4485,30 @@ ${optionsText}`;
         }, 60000);
     }
 
+    // 给自动刷课模块/父页面调用：当课程页内嵌章节测验 iframe 时，父页面可以进入对应 frame 调用 AI 答题。
+    // 只暴露必要能力，不改变原右侧浮窗的交互。
+    try {
+        window.cxAnswerExporter = {
+            version: APP.version,
+            hasQuestions: () => adapter.hasQuestions(),
+            getAnswerTargets: () => adapter.getAnswerTargets(),
+            aiAutoFill: () => handleAiFill(),
+            fillFromCollected: () => handleFillCollected(),
+            stop: () => autoFiller.stop(),
+            mount,
+            adapter,
+            store,
+            ui,
+            aiClient,
+            settingsStore,
+            autoFiller,
+            collector,
+            exporter,
+        };
+    } catch (error) {
+        console.warn('[CXAE] 暴露自动答题接口失败。', error);
+    }
+
     document.addEventListener('keydown', event => {
         if (event.key === 'Escape') {
             const session = store.load();
@@ -3685,4 +4530,777 @@ ${optionsText}`;
     });
 
     initialize();
+})();
+
+// == Chaoxing Study Auto Player module (combined) ==
+(() => {
+    'use strict';
+
+    const MODULE = Object.freeze({
+        id: 'cx-study-autoplayer',
+        name: '学习通超级工具·自动刷课',
+        version: '1.5.1',
+        settingsKey: 'CX_STUDY_AUTOPLAYER_SETTINGS',
+    });
+
+    function isStudyPage() {
+        return /\/mycourse\/studentstudy/i.test(location.href);
+    }
+
+    if (!isStudyPage()) return;
+    if (window[MODULE.id]) return;
+
+    const DEFAULT_SETTINGS = Object.freeze({
+        enabled: true,
+        playbackRate: 1.5,
+        autoplay: true,
+        retryInterval: 2000,
+        maxRetries: 10,
+        videoCheckInterval: 1000,
+        guardNoProgressMs: 7000,
+        guardResumeCooldownMs: 1500,
+        switchDelay: 3000,
+        skipQuiz: false,
+        solveQuizWithAi: true,
+        autoSubmitQuiz: true,
+        quizWaitTimeout: 90000,
+        quizSubmitDelay: 1200,
+    });
+
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const normalizeText = value => String(value ?? '').replace(/\s+/g, '').trim();
+
+    function loadSettings() {
+        try {
+            const parsed = JSON.parse(localStorage.getItem(MODULE.settingsKey) || '{}');
+            return { ...DEFAULT_SETTINGS, ...parsed };
+        } catch {
+            return { ...DEFAULT_SETTINGS };
+        }
+    }
+
+    function saveSettings(settings) {
+        const merged = { ...DEFAULT_SETTINGS, ...(settings || {}) };
+        try {
+            localStorage.setItem(MODULE.settingsKey, JSON.stringify(merged));
+        } catch (error) {
+            console.warn(`[${MODULE.id}] 保存设置失败`, error);
+        }
+        return merged;
+    }
+
+    function isVisible(element) {
+        if (!element || !element.isConnected) return false;
+        const view = element.ownerDocument?.defaultView || window;
+        const style = view.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+    }
+
+    function clickElement(element) {
+        if (!element) return false;
+        try {
+            const view = element.ownerDocument?.defaultView || window;
+            element.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+            element.dispatchEvent(new view.MouseEvent('mouseover', { bubbles: true, cancelable: true, view }));
+            element.dispatchEvent(new view.MouseEvent('mousedown', { bubbles: true, cancelable: true, view }));
+            element.dispatchEvent(new view.MouseEvent('mouseup', { bubbles: true, cancelable: true, view }));
+            element.dispatchEvent(new view.MouseEvent('click', { bubbles: true, cancelable: true, view }));
+            return true;
+        } catch (error) {
+            console.warn(`[${MODULE.id}] 点击失败`, error);
+            try { element.click(); return true; } catch { return false; }
+        }
+    }
+
+    function getDocumentFromFrame(frame) {
+        try {
+            return frame?.contentDocument || frame?.contentWindow?.document || null;
+        } catch {
+            return null;
+        }
+    }
+
+    class StudyAutoPlayer {
+        constructor() {
+            this.settings = loadSettings();
+            this._videoEl = null;
+            this._treeContainerEl = null;
+            this._isPlaying = false;
+            this._tryTimes = 0;
+            this._checkInterval = null;
+            this._stepSwitchAt = 0;
+            this._stepSwitchPending = false;
+            this._stepNavigationBound = false;
+            this._delayedNextUnitTimer = null;
+            this._guardLastTime = 0;
+            this._guardLastWallTs = 0;
+            this._guardLastResumeTs = 0;
+            this._quizBusy = false;
+            this._videoEndedHandling = false;
+            this._controlPanel = null;
+            this._keepAliveBound = false;
+            this._cellData = {
+                cells: 0,
+                nCells: 0,
+                currentCellIndex: 0,
+                currentNCellIndex: 0,
+                currentVideoTitle: '',
+            };
+        }
+
+        get cellData() {
+            return this._cellData;
+        }
+
+        run() {
+            this._createControlPanel();
+            if (!this.settings.enabled) {
+                console.log(`%c=== ${MODULE.name} 已关闭；可在“学习通超级工具”主浮窗重新开启 ===`, 'color:#9E9E9E');
+                return;
+            }
+            console.log(`%c=== ${MODULE.name} ${MODULE.version} 启动 ===`, 'color:#4CAF50;font-size:16px;font-weight:bold');
+            this.waitForCourseTreeAndStart();
+            this.bindPageKeepAlive();
+        }
+
+        waitForCourseTreeAndStart() {
+            const startedAt = Date.now();
+            const timer = setInterval(() => {
+                if (document.querySelector('#coursetree')) {
+                    clearInterval(timer);
+                    this.start();
+                    return;
+                }
+                if (Date.now() - startedAt > 60000) {
+                    clearInterval(timer);
+                    console.log(`[${MODULE.id}] 未找到课程目录，自动播放模块停止等待。`);
+                }
+            }, 500);
+        }
+
+        start() {
+            try {
+                this._getTreeContainer();
+                this._initCellData();
+                this._videoEl = null;
+                this._bindStepNavigation();
+                if (this.settings.autoplay) this.play();
+            } catch (error) {
+                console.error(`%c${MODULE.name} 运行失败：`, 'color:#F44336;font-weight:bold', error?.message || error);
+            }
+        }
+
+        _stopAutomation() {
+            this._isPlaying = false;
+            this._quizBusy = false;
+            this._videoEndedHandling = false;
+            this._clearCheckInterval();
+            if (this._delayedNextUnitTimer) {
+                clearTimeout(this._delayedNextUnitTimer);
+                this._delayedNextUnitTimer = null;
+            }
+            console.log(`%c${MODULE.name} 已暂停自动控制。`, 'color:#9E9E9E');
+        }
+
+        _updateSettings(patch = {}) {
+            const beforeEnabled = Boolean(this.settings.enabled);
+            this.settings = saveSettings({ ...this.settings, ...patch });
+            this._refreshControlPanel();
+
+            const video = this._getVideoEl?.();
+            if (video && patch.playbackRate != null) {
+                video.playbackRate = Number(this.settings.playbackRate) || DEFAULT_SETTINGS.playbackRate;
+            }
+
+            if (!this.settings.enabled) {
+                this._stopAutomation();
+                return;
+            }
+
+            if (!beforeEnabled && this.settings.enabled) {
+                console.log(`%c${MODULE.name} 已开启。`, 'color:#4CAF50');
+                this.waitForCourseTreeAndStart();
+                this.bindPageKeepAlive();
+            }
+        }
+
+        _createControlPanel() {
+            // 自动刷课设置已经合并到“学习通超级工具”主浮窗，不再单独创建面板，避免两个 UI 互相遮挡。
+        }
+
+        _refreshControlPanel() {
+            try {
+                window.cxAnswerExporter?.ui?.applyStudySettings?.();
+            } catch {}
+        }
+
+        _getTreeContainer() {
+            if (!this._treeContainerEl || !this._treeContainerEl.isConnected) {
+                const el = document.querySelector('#coursetree');
+                if (!el) throw new Error('找不到视频列表 #coursetree');
+                this._treeContainerEl = el;
+            }
+            return this._treeContainerEl;
+        }
+
+        _getTopLevelCells() {
+            const tree = this._getTreeContainer();
+            return Array.from(tree.querySelectorAll(':scope > ul > li'));
+        }
+
+        _getSubCells(cell) {
+            return Array.from(cell?.querySelectorAll?.('.posCatalog_select:not(.firstLayer)') || []);
+        }
+
+        _initCellData() {
+            const cells = this._getTopLevelCells();
+            let nCellCounts = 0;
+            let foundCurrent = false;
+
+            cells.forEach((cell, i) => {
+                const nCells = this._getSubCells(cell);
+                nCellCounts += nCells.length;
+                nCells.forEach((subCell, j) => {
+                    if (subCell.classList.contains('posCatalog_active')) {
+                        this._cellData.currentCellIndex = i;
+                        this._cellData.currentNCellIndex = j;
+                        foundCurrent = true;
+                        const titleSpan = subCell.querySelector('.posCatalog_name');
+                        this._cellData.currentVideoTitle = titleSpan?.getAttribute('title') || titleSpan?.textContent?.trim() || '';
+                    }
+                });
+            });
+
+            this._cellData.cells = cells.length;
+            this._cellData.nCells = nCellCounts;
+
+            if (!foundCurrent && nCellCounts > 0) {
+                console.warn('%c未找到当前激活的视频节点，可能需要手动选择。', 'color:#FF9800');
+            }
+            console.log(`%c课程信息：${this._cellData.cells}章，${this._cellData.nCells}节，当前：第${this._cellData.currentCellIndex + 1}章第${this._cellData.currentNCellIndex + 1}节`, 'color:#607D8B');
+        }
+
+        _findVideoInDocument(doc) {
+            if (!doc) return null;
+            const direct = doc.querySelector('video#video_html5_api, video');
+            if (direct) return direct;
+
+            const insertFrames = Array.from(doc.querySelectorAll('iframe.ans-insertvideo-online, iframe[src*="insertvideo"], iframe[src*="video"]'));
+            for (const frame of insertFrames) {
+                const frameDoc = getDocumentFromFrame(frame);
+                const video = frameDoc?.querySelector?.('video#video_html5_api, video');
+                if (video) return video;
+            }
+            return null;
+        }
+
+        _getVideoEl() {
+            if (this._videoEl && this._videoEl.isConnected) return this._videoEl;
+
+            let video = this._findVideoInDocument(document);
+            if (video) {
+                this._videoEl = video;
+                return video;
+            }
+
+            for (const frame of Array.from(document.querySelectorAll('iframe'))) {
+                const frameDoc = getDocumentFromFrame(frame);
+                video = this._findVideoInDocument(frameDoc);
+                if (video) {
+                    this._videoEl = video;
+                    return video;
+                }
+            }
+            return null;
+        }
+
+        _walkFrameContexts(rootWindow = window, depth = 0, result = []) {
+            if (depth > 6 || !rootWindow) return result;
+            let doc = null;
+            try { doc = rootWindow.document; } catch { return result; }
+            if (!doc?.documentElement) return result;
+            result.push({ win: rootWindow, doc, depth, url: doc.location?.href || '' });
+            for (const frame of Array.from(doc.querySelectorAll('iframe'))) {
+                try {
+                    const childWindow = frame.contentWindow;
+                    const childDoc = getDocumentFromFrame(frame);
+                    if (childWindow && childDoc?.documentElement) {
+                        this._walkFrameContexts(childWindow, depth + 1, result);
+                    }
+                } catch { /* 跨域 frame 忽略 */ }
+            }
+            return result;
+        }
+
+        _docText(doc) {
+            return String(doc?.body?.innerText || doc?.body?.textContent || '').replace(/\u00a0/g, ' ').trim();
+        }
+
+        _looksLikeQuizDoc(doc) {
+            if (!doc) return false;
+            const url = String(doc.location?.href || '');
+            const text = this._docText(doc);
+            if (/\/ananas\/modules\/work|\/mooc-ans\/api\/work|\/work\//i.test(url)) return true;
+            if (doc.querySelector('iframe[src*="/ananas/modules/work"], iframe[src*="/mooc-ans/api/work"]')) return true;
+            if (doc.querySelector('.TiMu, .newTiMu, .singleQuesId, .Zy_TItle, .question-item, .question-name, input.ofl-ipt')) return true;
+            return /章节测验|章節測驗|单选题|單選題|多选题|多選題|判断题|判斷題|填空题|填空題/.test(text);
+        }
+
+        _hasAnswerableQuiz(doc) {
+            if (!doc) return false;
+            if (doc.querySelector('input[type="radio"], input[type="checkbox"], input[type="text"], textarea, [contenteditable="true"], input.ofl-ipt')) return true;
+            if (doc.querySelector('li[role="option"], .Zy_ulTop li, .question-item li > .option-letter, .clearfix[role="option"]')) return true;
+            return Boolean(this._findSubmitButton(doc));
+        }
+
+        _isCompletedQuiz(doc) {
+            if (!doc || !this._looksLikeQuizDoc(doc)) return false;
+            const text = this._docText(doc);
+            const hasResultMarkers = /我的答案|我的答案：|本次成绩|本次成績|查看已批阅|查看已批閱|已批阅|已批閱|CorrectOrNot|scoreNum/.test(text) ||
+                Boolean(doc.querySelector('.newAnswerBx, .myAnswerBx, .answerScore, .CorrectOrNot, .scoreNum'));
+            const hasSubmit = Boolean(this._findSubmitButton(doc));
+            const hasInputs = Boolean(doc.querySelector('input[type="radio"], input[type="checkbox"], input[type="text"], textarea, [contenteditable="true"], input.ofl-ipt'));
+            return hasResultMarkers && !hasSubmit && !hasInputs;
+        }
+
+        _getQuizContexts() {
+            return this._walkFrameContexts()
+                .filter(context => this._looksLikeQuizDoc(context.doc))
+                .map(context => ({
+                    ...context,
+                    answerable: this._hasAnswerableQuiz(context.doc),
+                    completed: this._isCompletedQuiz(context.doc),
+                    helper: context.win?.cxAnswerExporter || null,
+                    textLength: this._docText(context.doc).length,
+                }))
+                .sort((left, right) => {
+                    const leftScore = (left.helper ? 80 : 0) + (left.answerable ? 50 : 0) + (left.completed ? -60 : 0) + Math.min(left.textLength, 5000) / 1000;
+                    const rightScore = (right.helper ? 80 : 0) + (right.answerable ? 50 : 0) + (right.completed ? -60 : 0) + Math.min(right.textLength, 5000) / 1000;
+                    return rightScore - leftScore;
+                });
+        }
+
+        _getPendingQuizContext() {
+            return this._getQuizContexts().find(context => context.answerable && !context.completed) || null;
+        }
+
+        _hasCompletedQuizContext() {
+            return this._getQuizContexts().some(context => context.completed);
+        }
+
+        async _waitForQuizHelper(context, timeout = this.settings.quizWaitTimeout || DEFAULT_SETTINGS.quizWaitTimeout) {
+            const startedAt = Date.now();
+            while (Date.now() - startedAt < timeout) {
+                const helper = context?.win?.cxAnswerExporter;
+                if (helper?.aiAutoFill && (helper.hasQuestions?.() || context.answerable || this._looksLikeQuizDoc(context.doc))) return helper;
+                await sleep(500);
+            }
+            return context?.win?.cxAnswerExporter || null;
+        }
+
+        _findSubmitButton(doc) {
+            if (!doc) return null;
+            const nodes = Array.from(doc.querySelectorAll('button, a, input[type="button"], input[type="submit"], [role="button"], [onclick], .btn, .jb_btn, .submitBtn, .submit-btn, .saveBtn'));
+            const candidates = [];
+            for (const node of nodes) {
+                if (!isVisible(node)) continue;
+                const text = String(node.tagName === 'INPUT' ? node.value : node.innerText || node.textContent || '').replace(/\s+/g, '').trim();
+                const hint = `${text} ${node.id || ''} ${node.className || ''} ${node.getAttribute?.('onclick') || ''}`;
+                if (!/(提交|保存|完成|交卷|确定提交|確認提交|提交答案|保存答案|save|submit)/i.test(hint)) continue;
+                if (/(AI讲解|AI講解|已完成|完成条件|完成條件|恢复全部设定|恢復全部設定|视频摘要|內容由AI生成|内容由AI生成)/i.test(hint)) continue;
+                let score = 0;
+                if (/提交|交卷|submit/i.test(hint)) score += 20;
+                if (/保存|save/i.test(hint)) score += 12;
+                if (/完成/i.test(hint)) score += 8;
+                if (['BUTTON', 'A', 'INPUT'].includes(node.tagName)) score += 5;
+                candidates.push({ node, score, text: hint });
+            }
+            candidates.sort((left, right) => right.score - left.score);
+            return candidates[0]?.node || null;
+        }
+
+        async _clickConfirmButtons() {
+            for (let round = 0; round < 6; round += 1) {
+                let clicked = false;
+                for (const context of this._walkFrameContexts()) {
+                    const nodes = Array.from(context.doc.querySelectorAll('button, a, input[type="button"], input[type="submit"], [role="button"], [onclick], .layui-layer-btn0, .el-button--primary, .sure, .confirm'));
+                    const target = nodes.find(node => {
+                        if (!isVisible(node)) return false;
+                        const text = String(node.tagName === 'INPUT' ? node.value : node.innerText || node.textContent || '').replace(/\s+/g, '').trim();
+                        const hint = `${text} ${node.className || ''} ${node.id || ''}`;
+                        return /^(确定|確認|确认|好的|是|提交|继续|知道了|OK)$/i.test(text) || /(layui-layer-btn0|el-button--primary|confirm|sure)/i.test(hint) && !/取消|关闭|關閉|cancel/i.test(hint);
+                    });
+                    if (target) {
+                        console.log('%c检测到提交确认框，点击确认。', 'color:#607D8B');
+                        clickElement(target);
+                        clicked = true;
+                    }
+                }
+                if (!clicked) return;
+                await sleep(800);
+            }
+        }
+
+        async _answerQuizIfPresent(reason = 'auto') {
+            if (!this.settings.solveQuizWithAi) return false;
+            if (this._quizBusy) return true;
+
+            const context = this._getPendingQuizContext();
+            if (!context) return false;
+
+            this._quizBusy = true;
+            this._clearCheckInterval();
+            this._isPlaying = false;
+            console.log(`%c检测到章节测验，开始 AI 作答（${reason}）。`, 'color:#673AB7;font-weight:bold');
+
+            try {
+                const helper = await this._waitForQuizHelper(context);
+                if (!helper?.aiAutoFill) {
+                    console.warn(`[${MODULE.id}] 找到测验 iframe，但没有找到 cxAnswerExporter 自动答题接口；请确认油猴允许在 iframe 中运行。`);
+                    return false;
+                }
+
+                helper.mount?.();
+                await helper.aiAutoFill();
+                await sleep(Number(this.settings.quizSubmitDelay) || DEFAULT_SETTINGS.quizSubmitDelay);
+
+                if (this.settings.autoSubmitQuiz) {
+                    const submit = this._findSubmitButton(context.doc) || this._findSubmitButton(document);
+                    if (submit) {
+                        console.log('%cAI 回填完成，尝试提交章节测验。', 'color:#4CAF50');
+                        clickElement(submit);
+                        await sleep(1000);
+                        await this._clickConfirmButtons();
+                    } else {
+                        console.log('%cAI 回填完成，但没有找到提交按钮；请手动确认提交。', 'color:#FF9800');
+                    }
+                }
+
+                await sleep(1500);
+                return true;
+            } catch (error) {
+                console.error(`[${MODULE.id}] 章节测验 AI 作答失败：`, error);
+                return false;
+            } finally {
+                this._quizBusy = false;
+            }
+        }
+
+        async _afterVideoEnded() {
+            if (this._videoEndedHandling) return;
+            this._videoEndedHandling = true;
+            this._isPlaying = false;
+            this._clearCheckInterval();
+            try {
+                await sleep(1000);
+                await this._answerQuizIfPresent('video-ended');
+                await sleep(1000);
+                this.nextUnit();
+            } finally {
+                setTimeout(() => { this._videoEndedHandling = false; }, 5000);
+            }
+        }
+
+        async play() {
+            if (!this.settings.enabled) return;
+            try {
+                const video = this._getVideoEl();
+                if (!video) {
+                    if (await this._answerQuizIfPresent('no-video')) {
+                        console.log('%c章节测验处理完成，准备进入下一节。', 'color:#4CAF50');
+                        setTimeout(() => this.nextUnit(), 1500);
+                        return;
+                    }
+                    if (this._hasCompletedQuizContext()) {
+                        console.log('%c检测到章节测验已完成，进入下一节。', 'color:#4CAF50');
+                        setTimeout(() => this.nextUnit(), 1000);
+                        return;
+                    }
+                    if (this._advanceLearningStep()) {
+                        console.log('%c当前不在视频页，已尝试切到“视频”学习步骤，2 秒后重试。', 'color:#607D8B');
+                        setTimeout(() => this.play(), 2000);
+                        return;
+                    }
+                    if (this.settings.skipQuiz) {
+                        console.log('%c未找到视频，启用兼容模式：跳过章节测验/非视频步骤，2 秒后继续。', 'color:#607D8B');
+                        const next = document.querySelector('#prevNextFocusNext');
+                        clickElement(next);
+                        setTimeout(() => this.play(), 2000);
+                        return;
+                    }
+                    console.log(`[${MODULE.id}] 未找到视频元素。`);
+                    return;
+                }
+
+                this._tryTimes = 0;
+                this._isPlaying = true;
+                this._videoEventHandle();
+                video.playbackRate = Number(this.settings.playbackRate) || DEFAULT_SETTINGS.playbackRate;
+
+                try {
+                    await video.play();
+                    console.log(`%c视频开始播放，倍速：${video.playbackRate}x`, 'color:#4CAF50');
+                    this._startVideoMonitoring();
+                } catch (playError) {
+                    console.error('视频播放失败：', playError);
+                    this._handlePlayError(playError);
+                }
+            } catch (error) {
+                if (this._tryTimes > Number(this.settings.maxRetries || DEFAULT_SETTINGS.maxRetries)) {
+                    console.error('%c视频播放失败，已达到最大重试次数。', 'color:#F44336;font-weight:bold', error);
+                    this._clearCheckInterval();
+                    return;
+                }
+                this._tryTimes += 1;
+                const interval = Number(this.settings.retryInterval) || DEFAULT_SETTINGS.retryInterval;
+                console.log(`%c播放失败，${interval / 1000} 秒后重试（${this._tryTimes}/${this.settings.maxRetries}）`, 'color:#FF9800');
+                setTimeout(() => this.play(), interval);
+            }
+        }
+
+        _advanceLearningStep() {
+            if (this._stepSwitchPending && Date.now() - this._stepSwitchAt < 4000) return true;
+
+            const prevTitle = document.querySelector('.prev_title');
+            const currentStepTitle = (prevTitle?.title || prevTitle?.textContent || '').trim();
+            if (currentStepTitle === '章节测验' || currentStepTitle === '视频') return false;
+
+            const videoTab = Array.from(document.querySelectorAll('.prev_white'))
+                .filter(isVisible)
+                .find(el => {
+                    const text = normalizeText(el.textContent || '');
+                    return text === '2视频' || text === '视频';
+                });
+            if (!videoTab) return false;
+
+            this._stepSwitchPending = true;
+            this._stepSwitchAt = Date.now();
+            console.log('%c尝试点击“视频”页签。', 'color:#2196F3');
+            return clickElement(videoTab);
+        }
+
+        _bindStepNavigation() {
+            if (this._stepNavigationBound) return;
+            this._stepNavigationBound = true;
+            document.addEventListener('click', event => {
+                const target = event.target?.closest?.('.prev_white');
+                if (!target) return;
+                const text = normalizeText(target.textContent || '');
+                if (!text.includes('视频')) return;
+                console.log(`%c检测到步骤切换点击：${text}，准备重新接管视频页。`, 'color:#607D8B');
+                this._videoEl = null;
+                this._isPlaying = false;
+                this._stepSwitchPending = true;
+                this._stepSwitchAt = Date.now();
+                setTimeout(() => {
+                    try { this._initCellData(); } catch {}
+                    this.play();
+                }, 1800);
+            }, true);
+        }
+
+        _clearCheckInterval() {
+            if (this._checkInterval) {
+                clearInterval(this._checkInterval);
+                this._checkInterval = null;
+            }
+        }
+
+        _startVideoMonitoring() {
+            this._clearCheckInterval();
+            this._guardLastTime = 0;
+            this._guardLastWallTs = 0;
+            this._guardLastResumeTs = 0;
+            const interval = Number(this.settings.videoCheckInterval) || DEFAULT_SETTINGS.videoCheckInterval;
+            this._checkInterval = setInterval(() => this._checkVideoStatus(), interval);
+        }
+
+        _tryResumePlayback(reason) {
+            const now = Date.now();
+            if (now - this._guardLastResumeTs < Number(this.settings.guardResumeCooldownMs || DEFAULT_SETTINGS.guardResumeCooldownMs)) return;
+            this._guardLastResumeTs = now;
+
+            const video = this._getVideoEl();
+            if (!video || !this._isPlaying) return;
+
+            console.log(`%c触发视频保活恢复（${reason}）`, 'color:#607D8B');
+            video.play().catch(error => {
+                console.warn('直接恢复播放失败，尝试静音恢复：', error);
+                video.muted = true;
+                video.play().catch(err => console.error('静音恢复播放失败：', err));
+            });
+        }
+
+        _checkVideoStatus() {
+            try {
+                const video = this._getVideoEl();
+                if (!video) return;
+
+                if (video.paused && this._isPlaying) {
+                    console.log('%c检测到视频暂停，尝试恢复播放。', 'color:#FF5722');
+                    this._tryResumePlayback('paused');
+                } else if (this._isPlaying && !video.ended) {
+                    const now = Date.now();
+                    const current = Number(video.currentTime || 0);
+                    if (this._guardLastWallTs === 0) {
+                        this._guardLastWallTs = now;
+                        this._guardLastTime = current;
+                    } else {
+                        const stalled = Math.abs(current - this._guardLastTime) < 0.01;
+                        const stalledMs = now - this._guardLastWallTs;
+                        if (stalled && stalledMs >= Number(this.settings.guardNoProgressMs || DEFAULT_SETTINGS.guardNoProgressMs)) {
+                            this._tryResumePlayback('no-progress');
+                            this._guardLastWallTs = now;
+                            this._guardLastTime = Number(video.currentTime || 0);
+                        } else if (!stalled) {
+                            this._guardLastWallTs = now;
+                            this._guardLastTime = current;
+                        }
+                    }
+                }
+
+                if (video.ended && this._isPlaying) {
+                    console.log('%c检测到视频结束，准备检查章节测验/切换下一个。', 'color:#9C27B0');
+                    this._afterVideoEnded();
+                }
+            } catch (error) {
+                console.error('视频状态检查失败：', error);
+            }
+        }
+
+        nextUnit() {
+            console.log('%c=== 准备切换到下一小节 ===', 'color:#2196F3;font-size:14px');
+            const cells = this._getTopLevelCells();
+            const currentCell = cells[this._cellData.currentCellIndex];
+            const nCells = this._getSubCells(currentCell);
+
+            if (nCells.length > this._cellData.currentNCellIndex + 1) {
+                const nextNIndex = this._cellData.currentNCellIndex + 1;
+                console.log(`%c切换到同章节下一个视频：${nextNIndex + 1}/${nCells.length}`, 'color:#FF9800');
+                this.playCurrentIndex(nCells[nextNIndex]);
+                return;
+            }
+
+            const nextIndex = this._cellData.currentCellIndex + 1;
+            if (nextIndex >= cells.length) {
+                console.log('%c=====================================', 'color:#4CAF50;font-size:16px');
+                console.log('%c==============本课程学习完成了==============', 'color:#4CAF50;font-size:16px;font-weight:bold');
+                console.log('%c=====================================', 'color:#4CAF50;font-size:16px');
+                this._clearCheckInterval();
+                return;
+            }
+
+            console.log(`%c切换到下一个章节：${nextIndex + 1}/${cells.length}`, 'color:#FF9800');
+            this._cellData.currentCellIndex = nextIndex;
+            this._cellData.currentNCellIndex = 0;
+            this.playCurrentIndex();
+        }
+
+        playCurrentIndex(nCell = null) {
+            if (!nCell) {
+                const cells = this._getTopLevelCells();
+                const currentCell = cells[this._cellData.currentCellIndex];
+                const nCells = this._getSubCells(currentCell);
+                nCell = nCells[this._cellData.currentNCellIndex];
+            }
+
+            const clickable = nCell?.querySelector?.('.posCatalog_name') || nCell;
+            if (!clickable) {
+                console.error('%c找不到可点击的课程节点，播放下一个视频失败。', 'color:#F44336');
+                setTimeout(() => this.nextUnit(), 2000);
+                return;
+            }
+
+            console.log(`%c点击切换到：${clickable.getAttribute?.('title') || clickable.textContent?.trim() || '未知标题'}`, 'color:#2196F3');
+            clickElement(clickable);
+            this._videoEl = null;
+            this._isPlaying = false;
+            console.log('%c等待视频加载。', 'color:#FF9800');
+            setTimeout(() => {
+                this._initCellData();
+                if (this.settings.autoplay) this.play();
+            }, Number(this.settings.switchDelay) || DEFAULT_SETTINGS.switchDelay);
+        }
+
+        _handlePlayError(error) {
+            console.error('播放错误详情：', error);
+            const video = this._getVideoEl();
+            if (!video) return;
+            video.muted = true;
+            video.play().then(() => {
+                console.log('%c静音播放成功。', 'color:#4CAF50');
+                if (this._delayedNextUnitTimer) {
+                    clearTimeout(this._delayedNextUnitTimer);
+                    this._delayedNextUnitTimer = null;
+                }
+            }).catch(err => {
+                console.error('静音播放也失败：', err);
+                if (this._delayedNextUnitTimer) clearTimeout(this._delayedNextUnitTimer);
+                this._delayedNextUnitTimer = setTimeout(() => {
+                    this._delayedNextUnitTimer = null;
+                    this.nextUnit();
+                }, 3000);
+            });
+        }
+
+        _videoEventHandle() {
+            const video = this._videoEl;
+            if (!video) return;
+            if (this._boundVideoEl === video) return;
+            this._boundVideoEl = video;
+            video.addEventListener('ended', () => {
+                const title = this._cellData.currentVideoTitle;
+                console.warn(`%c============ “${title}” 播放完成，检查章节测验 =============`, 'color:#4CAF50;font-weight:bold');
+                this._afterVideoEnded();
+            });
+            video.addEventListener('loadedmetadata', () => {
+                console.log('%c============ 视频加载完成 =============', 'color:#2196F3');
+                if (this.settings.autoplay && !this._isPlaying) this.play();
+            });
+            video.addEventListener('play', () => {
+                const title = this._cellData.currentVideoTitle;
+                console.info(`%c============ “${title}” 开始播放 =============`, 'color:#4CAF50');
+                this._isPlaying = true;
+                this._stepSwitchPending = false;
+                const current = this._getVideoEl();
+                this._guardLastTime = Number(current?.currentTime || 0);
+                this._guardLastWallTs = Date.now();
+                if (this._delayedNextUnitTimer) {
+                    clearTimeout(this._delayedNextUnitTimer);
+                    this._delayedNextUnitTimer = null;
+                }
+            });
+            video.addEventListener('pause', () => {
+                console.log('%c============ 视频暂停 =============', 'color:#FF9800');
+            });
+        }
+
+        bindPageKeepAlive() {
+            if (this._keepAliveBound) return;
+            this._keepAliveBound = true;
+            const resumePlaybackNow = () => this._tryResumePlayback('page-event');
+            const preventPause = event => {
+                if (!this._isPlaying) return;
+                event.stopPropagation();
+            };
+            document.addEventListener('mouseleave', preventPause, true);
+            window.addEventListener('mouseleave', preventPause, true);
+            document.addEventListener('mouseout', preventPause, true);
+            window.addEventListener('mouseout', preventPause, true);
+            window.addEventListener('blur', () => {
+                console.log('%c页面失去焦点，保持播放状态。', 'color:#607D8B');
+                resumePlaybackNow();
+            });
+            document.addEventListener('visibilitychange', () => {
+                if (document.hidden) console.log('%c页面切到后台，尝试保持播放状态。', 'color:#607D8B');
+                resumePlaybackNow();
+            });
+        }
+    }
+
+    const player = new StudyAutoPlayer();
+    window[MODULE.id] = player;
+    window.cxStudyAutoPlayer = player;
+    player.run();
 })();
