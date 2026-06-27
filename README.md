@@ -188,7 +188,7 @@ AI 功能需要以下额外权限：
 
 ### 一键安装
 
-[点击安装学习通超级工具](https://raw.githubusercontent.com/zenghaolinz/chaoxing-answer-exporter/main/chaoxing-learning-super-tool.user.js)
+[点击安装学习通超级工具](https://raw.githubusercontent.com/zenghaolinz/chaoxing-learning-super-tool/main/chaoxing-learning-super-tool.user.js)
 
 Tampermonkey 应自动打开安装页面。点击"安装"后刷新超星页面即可。
 
@@ -324,7 +324,7 @@ Markdown 和 JSON 可以作为备用。
 ## 项目结构
 
 ```text
-chaoxing-answer-exporter/
+chaoxing-learning-super-tool/
 ├── chaoxing-learning-super-tool.user.js
 ├── README.md
 ├── CHANGELOG.md

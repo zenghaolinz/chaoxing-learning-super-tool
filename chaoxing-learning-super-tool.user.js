@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         学习通超级工具
-// @namespace    https://github.com/zenghaolinz/chaoxing-answer-exporter
+// @namespace    https://github.com/zenghaolinz/chaoxing-learning-super-tool
 // @version      1.5.1
 // @description  学习通超级工具：题目采集/导出/AI答题/回填 + 视频自动播放、保活、自动下一节、章节测验 AI 作答，统一浮窗开关
 // @author       zenghaolinz
 // @license      MIT
-// @homepageURL  https://github.com/zenghaolinz/chaoxing-answer-exporter
-// @supportURL   https://github.com/zenghaolinz/chaoxing-answer-exporter/issues
+// @homepageURL  https://github.com/zenghaolinz/chaoxing-learning-super-tool
+// @supportURL   https://github.com/zenghaolinz/chaoxing-learning-super-tool/issues
 // @match        *://*.chaoxing.com/*
 // @match        *://mobilelearn.chaoxing.com/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js

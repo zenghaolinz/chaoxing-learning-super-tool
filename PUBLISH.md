@@ -3,7 +3,7 @@
 目标仓库：
 
 ```text
-https://github.com/zenghaolinz/chaoxing-answer-exporter
+https://github.com/zenghaolinz/chaoxing-learning-super-tool
 ```
 
 ## 使用 GitHub CLI
@@ -17,7 +17,7 @@ git commit -m "feat: initial release 1.0.0"
 git branch -M main
 
 gh auth login
-gh repo create zenghaolinz/chaoxing-answer-exporter --public --source=. --remote=origin --push
+gh repo create zenghaolinz/chaoxing-learning-super-tool --public --source=. --remote=origin --push
 ```
 
 ## 不使用 GitHub CLI
@@ -25,7 +25,7 @@ gh repo create zenghaolinz/chaoxing-answer-exporter --public --source=. --remote
 先在 GitHub 网页创建空仓库：
 
 ```text
-zenghaolinz/chaoxing-answer-exporter
+zenghaolinz/chaoxing-learning-super-tool
 ```
 
 不要勾选自动创建 README、LICENSE 或 `.gitignore`，然后运行：
@@ -35,7 +35,7 @@ git init
 git add .
 git commit -m "feat: initial release 1.0.0"
 git branch -M main
-git remote add origin https://github.com/zenghaolinz/chaoxing-answer-exporter.git
+git remote add origin https://github.com/zenghaolinz/chaoxing-learning-super-tool.git
 git push -u origin main
 ```
 
@@ -44,7 +44,7 @@ git push -u origin main
 推送完成后打开：
 
 ```text
-https://raw.githubusercontent.com/zenghaolinz/chaoxing-answer-exporter/main/chaoxing-learning-super-tool.user.js
+https://raw.githubusercontent.com/zenghaolinz/chaoxing-learning-super-tool/main/chaoxing-learning-super-tool.user.js
 ```
 
 正常情况下，Tampermonkey 会显示脚本安装页面。
