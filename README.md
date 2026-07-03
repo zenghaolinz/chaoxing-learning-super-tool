@@ -4,7 +4,7 @@
 
 脚本由两大模块组成：
 
-- **题目采集 / 导出 / AI 答题模块**：采集题目、选项与正确答案，导出为 Excel、Markdown 或 JSON；可选调用 DeepSeek 等 OpenAI 兼容 API 自动生成答案并回填；
+- **题目采集 / 导出 / AI 答题模块**：采集题目、选项与正确答案，导出为 Excel、Markdown 或 JSON；可选调用 DeepSeek 等 OpenAI 兼容 API（或 Claude 官方 /messages 协议）自动生成答案并回填，支持多服务商预设与图片题（OCR / 多模态识图）；
 - **自动刷课模块**：在课程学习页自动接管视频播放，倍速观看、卡顿自动恢复，播完自动进入下一节；遇到章节测验可调用 AI 自动作答并提交。
 
 > 默认只采集题目、选项和正确答案；AI 自动答题与自动刷课为可选功能，需自行配置 API Key 并按需开启。
@@ -16,7 +16,9 @@
 - **逐题换页采集**：保存当前题后自动进入下一题，页面刷新后继续任务；
 - **长卷同页采集**：一次解析当前页面已经加载的全部题目；
 - **随堂练习采集**：直接读取随堂练习页面已经加载的 `questionList` 数据；
-- **AI 自动答题**：调用 DeepSeek 等 OpenAI 兼容 API 生成答案并自动回填（支持自动翻页）；
+- **AI 自动答题**：调用 DeepSeek 等 OpenAI 兼容 API 或 Claude 官方 `/messages` 生成答案并自动回填（支持自动翻页）；
+- **多服务商预设**：一键套用 Agnes / 百炼 / 火山方舟 / 混元 / 智谱 / Kimi / MiniMax / OpenAI / Claude / OpenRouter 等配置；
+- **图片题处理**：自动 / 仅文字 / OCR / 多模态识图 / OCR+多模态，图片默认 Base64 发送避免超星图片 403；
 - **已采集答案回填**：将之前采集到的正确答案自动填入当前页面对应题目；
 - **自动显示答案**：未作答题存在"显示答案"时，尝试进入答案页后继续采集；
 - **断点恢复**：刷新、关闭页面或手动暂停后，可继续未完成任务；
@@ -97,13 +99,20 @@ https://mooc2-ans.chaoxing.com/mycourse/studentstudy
 
 1. 点击右下角"答"按钮打开面板；
 2. 在"设置"区域的 AI 配置中填写：
-   - **API Key**：你的 DeepSeek 或其他 OpenAI 兼容服务的密钥；
-   - **API 地址**：默认 `https://api.deepseek.com`（官方 DeepSeek API 会自动去除 `/v1` 后缀，并映射旧模型名）；
+   - **服务商预设**：可一键填入 Agnes、DeepSeek、阿里百炼/千问、火山方舟、腾讯混元、智谱 GLM、Kimi、MiniMax、OpenAI、Claude、OpenRouter 等预设的 API 地址、模型与图片模式；手动改地址/模型/接口类型会自动回到"自定义"；
+   - **接口类型**：`OpenAI 兼容 /chat/completions` 或 `Anthropic Claude /messages`；
+   - **API Key**：你的 DeepSeek 或其他 OpenAI 兼容服务 / Claude 官方的密钥；
+   - **API 地址**：默认 `https://api.deepseek.com`（官方 DeepSeek API 会自动去除 `/v1` 后缀，并映射旧模型名；常见少填 `/v1` 或 `compatible-mode/v1` 会自动补齐）；
    - **模型**：默认 `deepseek-v4-flash`；
    - **填充间隔**：每题之间的延迟，默认 500ms；
-   - **DeepSeek V4 打开思考**：可选开启更慢但更深入的推理模式（更耗额度）；
-3. 可点击"测试连接"验证配置；
+   - **打开思考**：通用开关，会按服务商自动使用 DeepSeek/Qwen/Claude/MiniMax/GLM/OpenAI 等思考参数；接口不支持时会去掉参数重试；
+   - **图片题处理**：`自动` / `仅文字` / `OCR 识别图片文字` / `多模态识图` / `OCR+多模态`；
+   - **图片发送方式**：`自动` / `Base64（登录图片更稳）` / `原图 URL`；图片过大自动压缩，超过限制自动截断；
+   - **最多发送图片数**：1–8 张，默认 3；
+3. 可点击"测试连接"验证配置，或"测试识图"探测接口是否接受图片输入；
 4. API Key 使用 `GM_setValue` 安全存储，不会写入 `localStorage`。
+
+> 图片题 / 多服务商预设的完整说明见 [README-image-ai.md](./README-image-ai.md)。
 
 ### 使用
 
@@ -327,6 +336,7 @@ Markdown 和 JSON 可以作为备用。
 chaoxing-learning-super-tool/
 ├── chaoxing-learning-super-tool.user.js
 ├── README.md
+├── README-image-ai.md
 ├── CHANGELOG.md
 ├── LICENSE
 └── .gitignore

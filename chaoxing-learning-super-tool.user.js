@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通超级工具
 // @namespace    https://github.com/zenghaolinz/chaoxing-learning-super-tool
-// @version      1.5.1
+// @version      1.5.5-image-ai
 // @description  学习通超级工具：题目采集/导出/AI答题/回填 + 视频自动播放、保活、自动下一节、章节测验 AI 作答，统一浮窗开关
 // @author       zenghaolinz
 // @license      MIT
@@ -42,11 +42,12 @@
     const APP = Object.freeze({
         id: 'cx-answer-exporter',
         name: '学习通超级工具',
-        version: '1.5.1',
+        version: '1.5.5-image-ai',
         storageVersion: 1,
         sessionPrefix: 'CXAE_SESSION_',
         settingsKey: 'CXAE_SETTINGS',
         aiTaskPrefix: 'CXAE_AI_TASK_',
+        visionCacheKey: 'CXAE_VISION_CAPABILITY_CACHE',
         maxRevealAttempts: 3,
         maxJumpAttempts: 2,
         navigationDelay: 120,
@@ -62,13 +63,167 @@
     const DEFAULT_SETTINGS = Object.freeze({
         autoRevealAnswer: true,
         includeTimestamp: true,
+        aiProviderPreset: 'custom',
+        aiApiProtocol: 'openai',
         aiApiBase: 'https://api.deepseek.com',
         aiApiKey: '',
         aiModel: 'deepseek-v4-flash',
         aiThinkingEnabled: false,
+        imageQuestionMode: 'auto',
+        imageMaxCount: 3,
+        imageMaxBytes: 2097152,
+        imageSendMode: 'auto',
         autoFillDelay: 500,
         collectionDelay: 120,
     });
+
+
+    const AI_PROVIDER_PRESETS = Object.freeze([
+        {
+            id: 'custom',
+            name: '自定义 / OpenAI 兼容',
+            protocol: 'openai',
+            apiBase: '',
+            model: '',
+            imageQuestionMode: 'auto',
+            imageSendMode: 'auto',
+            note: '手动填写 OpenAI-compatible 的 API 地址和模型名。',
+        },
+        {
+            id: 'agnes',
+            name: 'Agnes AI · agnes-2.0-flash',
+            protocol: 'openai',
+            apiBase: 'https://apihub.agnes-ai.com/v1',
+            model: 'agnes-2.0-flash',
+            imageQuestionMode: 'auto',
+            imageSendMode: 'base64',
+            note: 'Agnes 是 OpenAI 兼容接口；超星图片 URL 常被服务端 403，预设优先用 Base64。',
+        },
+        {
+            id: 'deepseek-official',
+            name: 'DeepSeek 官方 · V4 Flash（文字）',
+            protocol: 'openai',
+            apiBase: 'https://api.deepseek.com',
+            model: 'deepseek-v4-flash',
+            imageQuestionMode: 'ocr',
+            imageSendMode: 'auto',
+            note: '官方 DeepSeek 当前按文字模型处理；图片题建议 OCR 或换视觉模型。',
+        },
+        {
+            id: 'aliyun-bailian-qwen-vl',
+            name: '阿里百炼/千问 · Qwen3-VL',
+            protocol: 'openai',
+            apiBase: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+            model: 'qwen3-vl-plus',
+            imageQuestionMode: 'auto',
+            imageSendMode: 'base64',
+            note: '也可改成业务空间专属域名：https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1。',
+        },
+        {
+            id: 'aliyun-bailian-qwen-text',
+            name: '阿里百炼/千问 · Qwen Plus（文字）',
+            protocol: 'openai',
+            apiBase: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+            model: 'qwen-plus',
+            imageQuestionMode: 'ocr',
+            imageSendMode: 'auto',
+            note: '文本模型不直接看图；图片题会走 OCR/降级。',
+        },
+        {
+            id: 'volcengine-ark',
+            name: '字节火山方舟 · 豆包视觉（填接入点 ID）',
+            protocol: 'openai',
+            apiBase: 'https://ark.cn-beijing.volces.com/api/v3',
+            model: 'ep-替换为你的接入点ID',
+            imageQuestionMode: 'auto',
+            imageSendMode: 'base64',
+            note: '火山方舟常用“推理接入点 ID（ep-...）”作为 model；也可填控制台给出的模型/接入点名称。',
+        },
+        {
+            id: 'tencent-hunyuan-vision',
+            name: '腾讯混元 · hunyuan-vision',
+            protocol: 'openai',
+            apiBase: 'https://api.hunyuan.cloud.tencent.com/v1',
+            model: 'hunyuan-vision',
+            imageQuestionMode: 'auto',
+            imageSendMode: 'base64',
+            note: '混元 OpenAI 兼容接口支持 /v1/chat/completions；hunyuan-vision 用于图生文/识图。',
+        },
+        {
+            id: 'zhipu-glm-vision',
+            name: '智谱 GLM · 视觉模型',
+            protocol: 'openai',
+            apiBase: 'https://open.bigmodel.cn/api/paas/v4',
+            model: 'glm-5v-turbo',
+            imageQuestionMode: 'auto',
+            imageSendMode: 'base64',
+            note: '若账号未开通 glm-5v-turbo，可换成控制台可用的 glm-4v/GLM-4.5V 等视觉模型。',
+        },
+        {
+            id: 'kimi-cn',
+            name: 'Kimi/Moonshot 中国区',
+            protocol: 'openai',
+            apiBase: 'https://api.moonshot.cn/v1',
+            model: 'moonshot-v1-8k',
+            imageQuestionMode: 'ocr',
+            imageSendMode: 'auto',
+            note: 'moonshot-v1 系列偏文本；若使用 Kimi 多模态模型，请把模型名改成控制台已开通的视觉模型。',
+        },
+        {
+            id: 'kimi-global',
+            name: 'Kimi/Moonshot Global',
+            protocol: 'openai',
+            apiBase: 'https://api.moonshot.ai/v1',
+            model: 'moonshot-v1-8k',
+            imageQuestionMode: 'ocr',
+            imageSendMode: 'auto',
+            note: '海外 Kimi Open Platform；图片题默认 OCR，视觉模型需按控制台模型名修改。',
+        },
+        {
+            id: 'minimax',
+            name: 'MiniMax · MiniMax-M3',
+            protocol: 'openai',
+            apiBase: 'https://api.minimax.io/v1',
+            model: 'MiniMax-M3',
+            imageQuestionMode: 'auto',
+            imageSendMode: 'base64',
+            note: 'MiniMax OpenAI 格式接口；如使用旧版 minimaxi 域名，可手动改为控制台提示的地址。',
+        },
+        {
+            id: 'openai',
+            name: 'OpenAI · GPT-4.1 mini',
+            protocol: 'openai',
+            apiBase: 'https://api.openai.com/v1',
+            model: 'gpt-4.1-mini',
+            imageQuestionMode: 'auto',
+            imageSendMode: 'base64',
+            note: 'OpenAI 视觉输入支持图片 URL 与 Base64 data URL；Base64 对登录态图片更稳。',
+        },
+        {
+            id: 'anthropic-claude',
+            name: 'Claude 官方 · Sonnet 4.5/4.6',
+            protocol: 'anthropic',
+            apiBase: 'https://api.anthropic.com/v1',
+            model: 'claude-sonnet-4-5',
+            imageQuestionMode: 'auto',
+            imageSendMode: 'base64',
+            note: 'Claude 官方不是 /chat/completions；本脚本会用 Anthropic Messages 协议调用。模型名可按控制台改为 claude-sonnet-4-6 等。',
+        },
+        {
+            id: 'openrouter',
+            name: 'OpenRouter 聚合 · 自选模型',
+            protocol: 'openai',
+            apiBase: 'https://openrouter.ai/api/v1',
+            model: 'openai/gpt-4.1-mini',
+            imageQuestionMode: 'auto',
+            imageSendMode: 'base64',
+            note: '聚合平台可接 GPT/Claude/Gemini/Kimi 等；模型名按 OpenRouter 控制台填写。',
+        },
+    ]);
+
+    function getAiProviderPreset(id) {
+        return AI_PROVIDER_PRESETS.find(item => item.id === id) || AI_PROVIDER_PRESETS[0];
+    }
 
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -150,6 +305,14 @@
                     if (settings.aiModel === 'deepseek-chat') settings.aiModel = 'deepseek-v4-flash';
                     if (settings.aiModel === 'deepseek-reasoner') settings.aiModel = 'deepseek-v4-pro';
                 }
+                const apiBaseText = normalizeText(settings.aiApiBase);
+                if (/dashscope\.aliyuncs\.com\/compatible-mode\/?$/i.test(apiBaseText)) {
+                    settings.aiApiBase = `${apiBaseText.replace(/\/+$/, '')}/v1`;
+                }
+                if (/apihub\.agnes-ai\.com\/?$/i.test(apiBaseText)) {
+                    settings.aiApiBase = `${apiBaseText.replace(/\/+$/, '')}/v1`;
+                }
+                settings.aiApiProtocol = normalizeText(settings.aiApiProtocol || 'openai').toLowerCase() === 'anthropic' ? 'anthropic' : 'openai';
                 // 从 GM 安全存储读取 API Key（如果可用）
                 if (typeof GM_getValue === 'function') {
                     const secureKey = GM_getValue('CXAE_AI_API_KEY', '');
@@ -2531,7 +2694,317 @@
             return this.settingsStore.load();
         }
 
-        buildPrompt({ type, question, options }) {
+        resolveImageMode(value) {
+            const mode = normalizeText(value || 'auto').toLowerCase();
+            const aliases = {
+                off: 'text',
+                none: 'text',
+                textonly: 'text',
+                text: 'text',
+                auto: 'auto',
+                vision: 'vision',
+                multimodal: 'vision',
+                ocr: 'ocr',
+                'ocr-vision': 'ocr-vision',
+                ocrvision: 'ocr-vision',
+                both: 'ocr-vision',
+            };
+            return aliases[mode] || 'auto';
+        }
+
+        normalizeImageList(images = []) {
+            const result = [];
+            const seen = new Set();
+            for (const value of Array.isArray(images) ? images : [images]) {
+                const url = normalizeText(value);
+                if (!url || seen.has(url)) continue;
+                seen.add(url);
+                result.push(url);
+            }
+            return result;
+        }
+
+        supportsLocalOcr() {
+            return typeof window !== 'undefined' &&
+                typeof window.TextDetector === 'function' &&
+                typeof createImageBitmap === 'function';
+        }
+
+        visionCacheKey(provider) {
+            return `${normalizeText(provider?.url)}|${normalizeText(provider?.model)}`;
+        }
+
+        loadVisionCache() {
+            try {
+                const cache = JSON.parse(localStorage.getItem(APP.visionCacheKey) || '{}');
+                return cache && typeof cache === 'object' ? cache : {};
+            } catch {
+                return {};
+            }
+        }
+
+        getVisionCache(provider) {
+            const cache = this.loadVisionCache();
+            const entry = cache[this.visionCacheKey(provider)];
+            if (!entry || Date.now() - Number(entry.at || 0) > 7 * 24 * 60 * 60 * 1000) return null;
+            return entry;
+        }
+
+        setVisionCache(provider, capable, message = '') {
+            try {
+                const cache = this.loadVisionCache();
+                cache[this.visionCacheKey(provider)] = {
+                    capable: Boolean(capable),
+                    message: normalizeText(message).slice(0, 240),
+                    at: Date.now(),
+                };
+                localStorage.setItem(APP.visionCacheKey, JSON.stringify(cache));
+            } catch (error) {
+                console.debug('[CXAE] 保存视觉能力缓存失败。', error);
+            }
+        }
+
+        isAgnesProvider(provider) {
+            const model = normalizeText(provider?.model).toLowerCase();
+            const url = normalizeText(provider?.url).toLowerCase();
+            return /agnes-ai\.com|apihub\.agnes-ai\.com/i.test(url) || /^agnes-[\w.-]*flash$/i.test(model);
+        }
+
+        isLikelyVisionModel(provider) {
+            const model = normalizeText(provider?.model).toLowerCase();
+            const url = normalizeText(provider?.url).toLowerCase();
+            if (provider?.isOfficialDeepSeek) return false;
+            if (this.isAgnesProvider(provider)) return true;
+            if (/vision|vl|qwen\d*(?:\.\d+)?-vl|qwen.*vl|gpt-4o|gpt-4\.1|gpt-5|gemini|claude|pixtral|llava|glm-[45]v|glm-.*v|hunyuan-vision|doubao|seed|minimax/i.test(model)) return true;
+            if (/openai|azure|dashscope|bigmodel|siliconflow|volcengine|ark|googleapis|anthropic|moonshot|openrouter|minimax|hunyuan|agnes/i.test(url)) return true;
+            return false;
+        }
+
+        shouldTryVision(provider, mode) {
+            if (mode === 'vision' || mode === 'ocr-vision') return true;
+            if (mode !== 'auto') return false;
+            const cached = this.getVisionCache(provider);
+            if (cached?.capable === true) return true;
+            if (cached?.capable === false) return false;
+            return this.isLikelyVisionModel(provider);
+        }
+
+        isVisionUnsupportedError(error) {
+            const message = normalizeText(error?.message || error).toLowerCase();
+            return /image|vision|multi.?modal|multimodal|image_url|base64|content.*array|invalid.*content|unsupported|not support|400|request parameter/i.test(message);
+        }
+
+        dataUrlToBlob(dataUrl) {
+            const match = String(dataUrl || '').match(/^data:([^;,]+)?(;base64)?,(.*)$/i);
+            if (!match) throw new Error('图片 data URL 格式无效');
+            const mime = match[1] || 'application/octet-stream';
+            const isBase64 = Boolean(match[2]);
+            const raw = isBase64 ? atob(match[3]) : decodeURIComponent(match[3]);
+            const bytes = new Uint8Array(raw.length);
+            for (let index = 0; index < raw.length; index += 1) bytes[index] = raw.charCodeAt(index);
+            return new Blob([bytes], { type: mime });
+        }
+
+        async fetchImageBlob(url) {
+            const source = normalizeText(url);
+            if (!source) throw new Error('图片地址为空');
+            if (/^data:/i.test(source)) return this.dataUrlToBlob(source);
+
+            const absolute = (() => {
+                try { return new URL(source, location.href).href; } catch { return source; }
+            })();
+
+            if (typeof GM_xmlhttpRequest !== 'undefined') {
+                return new Promise((resolve, reject) => {
+                    GM_xmlhttpRequest({
+                        method: 'GET',
+                        url: absolute,
+                        responseType: 'blob',
+                        anonymous: false,
+                        onload(response) {
+                            const status = Number(response.status) || 0;
+                            if (status < 200 || status >= 300) {
+                                reject(new Error(`图片下载失败（${status || '网络错误'}）`));
+                                return;
+                            }
+                            const blob = response.response;
+                            if (blob instanceof Blob) {
+                                resolve(blob);
+                                return;
+                            }
+                            reject(new Error('图片响应不是 Blob'));
+                        },
+                        onerror() { reject(new Error('图片网络请求失败')); },
+                        ontimeout() { reject(new Error('图片下载超时')); },
+                        timeout: 20000,
+                    });
+                });
+            }
+
+            const response = await fetch(absolute, { credentials: 'include' });
+            if (!response.ok) throw new Error(`图片下载失败（${response.status}）`);
+            return response.blob();
+        }
+
+        blobToDataUrl(blob) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(String(reader.result || ''));
+                reader.onerror = () => reject(new Error('图片转 base64 失败'));
+                reader.readAsDataURL(blob);
+            });
+        }
+
+        async compressImageBlob(blob, maxBytes = 2097152) {
+            if (!(blob instanceof Blob)) throw new Error('图片数据无效');
+            if (!blob.type || !/^image\//i.test(blob.type)) return blob;
+            if (blob.size <= maxBytes) return blob;
+            if (typeof document === 'undefined' || typeof URL === 'undefined') return blob;
+
+            const objectUrl = URL.createObjectURL(blob);
+            try {
+                const image = await new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.onload = () => resolve(img);
+                    img.onerror = () => reject(new Error('图片压缩加载失败'));
+                    img.src = objectUrl;
+                });
+                const maxSide = 1280;
+                const ratio = Math.min(1, maxSide / Math.max(image.naturalWidth || image.width || maxSide, image.naturalHeight || image.height || maxSide));
+                const canvas = document.createElement('canvas');
+                canvas.width = Math.max(1, Math.round((image.naturalWidth || image.width || maxSide) * ratio));
+                canvas.height = Math.max(1, Math.round((image.naturalHeight || image.height || maxSide) * ratio));
+                const context = canvas.getContext('2d');
+                if (!context) return blob;
+                context.drawImage(image, 0, 0, canvas.width, canvas.height);
+                const compressed = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.72));
+                return compressed instanceof Blob && compressed.size < blob.size ? compressed : blob;
+            } catch (error) {
+                console.debug('[CXAE] 图片压缩失败，使用原图。', error);
+                return blob;
+            } finally {
+                URL.revokeObjectURL(objectUrl);
+            }
+        }
+
+        async imageUrlToDataUrl(url, maxBytes = 2097152) {
+            const blob = await this.fetchImageBlob(url);
+            const compressed = await this.compressImageBlob(blob, maxBytes);
+            if (compressed.size > Math.max(maxBytes * 1.8, maxBytes + 512000)) {
+                throw new Error(`图片过大（${Math.round(compressed.size / 1024)}KB），请调大图片大小限制或减少图片数量`);
+            }
+            return this.blobToDataUrl(compressed);
+        }
+
+        resolveImageSendMode(value) {
+            const mode = normalizeText(value || 'auto').toLowerCase();
+            const aliases = {
+                auto: 'auto',
+                base64: 'base64',
+                dataurl: 'base64',
+                data: 'base64',
+                url: 'url',
+                link: 'url',
+            };
+            return aliases[mode] || 'auto';
+        }
+
+        resolveImageUrl(url) {
+            const source = normalizeText(url);
+            if (!source) return '';
+            if (/^data:/i.test(source)) return source;
+            try { return new URL(source, location.href).href; } catch { return source; }
+        }
+
+        getVisionTransportStrategies(provider, settings = this.getSettings()) {
+            const mode = this.resolveImageSendMode(settings.imageSendMode);
+            if (mode === 'base64') return ['base64'];
+            if (mode === 'url') return ['url'];
+            // 登录态/防盗链图片直接给模型 URL 经常 403；自动模式优先 Base64，再用 URL 兜底。
+            return ['base64', 'url'];
+        }
+
+        prepareVisionImageUrls(images, settings = this.getSettings()) {
+            const maxCount = clampNumber(settings.imageMaxCount, 1, 8, 3);
+            const selected = this.normalizeImageList(images).slice(0, maxCount).map(url => this.resolveImageUrl(url)).filter(Boolean);
+            return {
+                urls: selected,
+                errors: [],
+                truncated: this.normalizeImageList(images).length > maxCount,
+            };
+        }
+
+        async prepareVisionImages(images, settings = this.getSettings()) {
+            const maxCount = clampNumber(settings.imageMaxCount, 1, 8, 3);
+            const maxBytes = clampNumber(settings.imageMaxBytes, 256 * 1024, 8 * 1024 * 1024, 2 * 1024 * 1024);
+            const selected = this.normalizeImageList(images).slice(0, maxCount);
+            const dataUrls = [];
+            const errors = [];
+
+            for (const image of selected) {
+                try {
+                    dataUrls.push(await this.imageUrlToDataUrl(image, maxBytes));
+                } catch (error) {
+                    errors.push(`${image.slice(0, 80)}：${error?.message || error}`);
+                    console.warn('[CXAE] 图片准备失败。', image, error);
+                }
+            }
+
+            return { dataUrls, errors, truncated: this.normalizeImageList(images).length > maxCount };
+        }
+
+        async prepareVisionInputs(images, provider, settings = this.getSettings(), strategy = 'base64') {
+            if (strategy === 'url') {
+                const prepared = this.prepareVisionImageUrls(images, settings);
+                return { sources: prepared.urls, errors: prepared.errors, truncated: prepared.truncated, strategy: 'url' };
+            }
+            const prepared = await this.prepareVisionImages(images, settings);
+            return { sources: prepared.dataUrls, errors: prepared.errors, truncated: prepared.truncated, strategy: 'base64' };
+        }
+
+        async collectLocalOcrText(images, settings = this.getSettings()) {
+            const selected = this.normalizeImageList(images).slice(0, clampNumber(settings.imageMaxCount, 1, 8, 3));
+            if (!selected.length) return { text: '', warnings: [] };
+            if (!this.supportsLocalOcr()) {
+                return { text: '', warnings: ['当前浏览器不支持本地 OCR（TextDetector），可切换为“多模态识图”或使用支持视觉的模型。'] };
+            }
+
+            const warnings = [];
+            const blocks = [];
+            for (let index = 0; index < selected.length; index += 1) {
+                let bitmap = null;
+                try {
+                    const blob = await this.fetchImageBlob(selected[index]);
+                    bitmap = await createImageBitmap(blob);
+                    const detector = new window.TextDetector();
+                    const detections = await detector.detect(bitmap);
+                    const text = detections
+                        .map(item => normalizeText(item.rawValue || item.text || ''))
+                        .filter(Boolean)
+                        .join('\n');
+                    if (text) blocks.push(`图${index + 1} OCR：\n${text}`);
+                    else warnings.push(`图${index + 1} 未识别到文字`);
+                } catch (error) {
+                    warnings.push(`图${index + 1} OCR 失败：${error?.message || error}`);
+                    console.warn('[CXAE] OCR 失败。', selected[index], error);
+                } finally {
+                    try { bitmap?.close?.(); } catch {}
+                }
+            }
+            return { text: blocks.join('\n\n'), warnings };
+        }
+
+        buildVisionUserContent(prompt, imageDataUrls) {
+            return [
+                { type: 'text', text: prompt },
+                ...imageDataUrls.map(url => ({
+                    type: 'image_url',
+                    image_url: { url, detail: 'auto' },
+                })),
+            ];
+        }
+
+        buildPrompt({ type, question, options, imageOcrText = '', imageCount = 0 }) {
             const optionsText = options?.length
                 ? options.map((opt, i) => {
                     const content = normalizeText(opt).replace(/^[A-H\uFF21-\uFF28]\s*[.\u3001\uFF0E:\uFF1A)\uFF09]\s*/, '');
@@ -2555,10 +3028,17 @@
                 typeInstruction = '请判断题型并只返回答案本身：单选返回一个字母，多选返回逗号分隔字母，判断返回“对”或“错”，填空多空用 | 分隔。';
             }
 
+            const imageHint = imageCount > 0
+                ? `\n\n图片：本题包含 ${imageCount} 张图片。请结合图片内容作答；如果下方有 OCR 内容，也要一起参考。`
+                : '';
+            const ocrBlock = normalizeText(imageOcrText)
+                ? `\n\n图片OCR内容：\n${imageOcrText}`
+                : '';
+
             return `${typeInstruction}
 不要解释，不要复述题目，不要使用 Markdown，不要输出 JSON。
 
-题目：${question}
+题目：${question}${imageHint}${ocrBlock}
 
 选项：
 ${optionsText}`;
@@ -2570,16 +3050,30 @@ ${optionsText}`;
             const apiKey = normalizeText(settings.aiApiKey || '');
             let model = normalizeText(settings.aiModel || 'deepseek-v4-flash');
             const aiThinkingEnabled = Boolean(settings.aiThinkingEnabled);
+            let protocol = normalizeText(settings.aiApiProtocol || 'openai').toLowerCase();
+            protocol = protocol === 'anthropic' ? 'anthropic' : 'openai';
 
             if (!apiKey) throw new Error('未配置 AI API Key，请在设置中填写');
             if (!/^https?:\/\//i.test(apiBase)) throw new Error('AI API 地址格式不正确');
 
-            let isOfficialDeepSeek = false;
+            let parsed;
             try {
-                const parsed = new URL(apiBase);
-                isOfficialDeepSeek = parsed.hostname.toLowerCase() === 'api.deepseek.com';
+                parsed = new URL(apiBase);
             } catch {
                 throw new Error('AI API 地址格式不正确');
+            }
+
+            const hostname = parsed.hostname.toLowerCase();
+            let isOfficialDeepSeek = hostname === 'api.deepseek.com';
+            const path = parsed.pathname.replace(/\/+$/, '');
+
+            // 容错：常见 OpenAI-compatible 服务如果少填了 /v1 或 compatible-mode/v1，自动补齐。
+            if (/dashscope\.aliyuncs\.com$/i.test(hostname) && /\/compatible-mode$/i.test(path)) {
+                parsed.pathname = `${path}/v1`;
+                apiBase = parsed.toString().replace(/\/+$/, '');
+            } else if (/(?:api\.)?moonshot\.(?:cn|ai)$|api\.openai\.com$|api\.minimax\.io$|apihub\.agnes-ai\.com$|api\.hunyuan\.cloud\.tencent\.com$/i.test(hostname) && !/\/v1$/i.test(path) && !/\/chat\/completions$/i.test(path)) {
+                parsed.pathname = `${path || ''}/v1`.replace(/\/+/g, '/');
+                apiBase = parsed.toString().replace(/\/+$/, '');
             }
 
             if (isOfficialDeepSeek) {
@@ -2589,11 +3083,132 @@ ${optionsText}`;
             }
 
             const normalizedBase = apiBase.replace(/\/+$/, '');
-            const url = /\/chat\/completions$/i.test(normalizedBase)
-                ? normalizedBase
-                : `${normalizedBase}/chat/completions`;
+            let url = '';
+            if (protocol === 'anthropic') {
+                url = /\/messages$/i.test(normalizedBase) ? normalizedBase : `${normalizedBase}/messages`;
+            } else {
+                url = /\/chat\/completions$/i.test(normalizedBase)
+                    ? normalizedBase
+                    : `${normalizedBase}/chat/completions`;
+            }
 
-            return { apiKey, model, url, isOfficialDeepSeek, aiThinkingEnabled };
+            return { apiKey, model, url, apiBase: normalizedBase, protocol, isOfficialDeepSeek, aiThinkingEnabled };
+        }
+
+        getProviderTemperature(provider) {
+            const model = normalizeText(provider?.model || '').toLowerCase();
+            const url = normalizeText(provider?.url || '').toLowerCase();
+            // Kimi K2 系列部分接口严格要求 temperature=1。
+            if (/kimi-k2/i.test(model) || (/moonshot|kimi/i.test(url) && /k2/i.test(model))) return 1;
+            return 0.1;
+        }
+
+        getProviderHost(provider) {
+            try {
+                return new URL(provider?.apiBase || provider?.url || '').hostname.toLowerCase();
+            } catch {
+                return '';
+            }
+        }
+
+        isLikelyReasoningModel(model = '') {
+            const text = normalizeText(model).toLowerCase();
+            return /(^o\d|^o[1-9]|gpt-[5-9]|gpt-oss|reason|thinking|think|qwq|qvq|qwen3|deepseek-r1|deepseek-v\d|kimi-k2|glm-4\.5|glm-4\.7|glm-5|minimax-m[23]|doubao.*thinking|seed.*thinking)/i.test(text);
+        }
+
+        applyThinkingControlToPayload(payload, provider) {
+            const applied = [];
+            const add = (key, value) => {
+                payload[key] = value;
+                applied.push(key);
+            };
+            const bumpMaxTokens = (minimum = 4096) => {
+                const current = Number(payload.max_tokens || payload.max_completion_tokens || 0);
+                if (payload.max_completion_tokens != null) {
+                    payload.max_completion_tokens = Math.max(current, minimum);
+                } else {
+                    payload.max_tokens = Math.max(current || 2048, minimum);
+                }
+            };
+
+            const enabled = Boolean(provider?.aiThinkingEnabled);
+            const model = normalizeText(provider?.model || '').toLowerCase();
+            const host = this.getProviderHost(provider);
+            const baseOrUrl = normalizeText(`${provider?.apiBase || ''} ${provider?.url || ''}`).toLowerCase();
+
+            // Anthropic 官方 Messages API：打开时显式启用 extended thinking；关闭时不发送 thinking 字段。
+            if (provider?.protocol === 'anthropic') {
+                if (enabled) {
+                    add('thinking', { type: 'enabled', budget_tokens: 1024 });
+                    bumpMaxTokens(4096);
+                }
+                return applied;
+            }
+
+            // DeepSeek 官方 V4：支持 enabled / disabled 两种显式模式。
+            if (provider?.isOfficialDeepSeek && /^deepseek-v4-/i.test(model)) {
+                add('thinking', { type: enabled ? 'enabled' : 'disabled' });
+                if (enabled) bumpMaxTokens(4096);
+                return applied;
+            }
+
+            // 阿里百炼 / 千问 OpenAI-compatible：enable_thinking 是顶层扩展参数。
+            if (/dashscope\.aliyuncs\.com|maas\.aliyuncs\.com/i.test(host) || /\b(qwen|qwq|qvq)\b/i.test(model)) {
+                add('enable_thinking', enabled);
+                if (enabled && /(qwen3|qwq|qvq|kimi-k2|glm|deepseek)/i.test(model)) {
+                    add('thinking_budget', 1024);
+                    bumpMaxTokens(4096);
+                }
+                return applied;
+            }
+
+            // MiniMax OpenAI-compatible：M3 使用 thinking.type 控制，adaptive 等同打开。
+            if (/minimax/i.test(host) || /minimax-m[23]/i.test(model)) {
+                add('thinking', { type: enabled ? 'adaptive' : 'disabled' });
+                if (enabled) bumpMaxTokens(4096);
+                return applied;
+            }
+
+            // 智谱 / Z.ai GLM 系列：GLM 混合思考模型常用 thinking.type 控制。
+            if (/bigmodel\.cn|z\.ai|zhipu/i.test(host) || /glm-(4\.5|4\.7|5)/i.test(model)) {
+                add('thinking', { type: enabled ? 'enabled' : 'disabled' });
+                if (enabled) bumpMaxTokens(4096);
+                return applied;
+            }
+
+            // 火山方舟 / 豆包思考模型：兼容常见 thinking.type 控制；不支持时会自动去掉参数重试。
+            if (/volces\.com|volcengine|ark\.cn/i.test(host) || /doubao|seed.*thinking/i.test(model)) {
+                add('thinking', { type: enabled ? 'enabled' : 'disabled' });
+                if (enabled) bumpMaxTokens(4096);
+                return applied;
+            }
+
+            // OpenAI 官方 Chat Completions reasoning 模型：reasoning_effort 控制推理强度。
+            if (/api\.openai\.com$/i.test(host) && /^(?:o\d|o[1-9]|gpt-5|gpt-oss)/i.test(model)) {
+                add('reasoning_effort', enabled ? 'medium' : 'low');
+                if (enabled) bumpMaxTokens(4096);
+                return applied;
+            }
+
+            // OpenRouter 等聚合平台：部分模型接受 reasoning 对象；不支持时自动去掉参数重试。
+            if (/openrouter/i.test(host) && this.isLikelyReasoningModel(model)) {
+                add('reasoning', enabled ? { enabled: true, effort: 'medium' } : { enabled: false });
+                if (enabled) bumpMaxTokens(4096);
+                return applied;
+            }
+
+            return applied;
+        }
+
+        removeThinkingControlFromPayload(payload) {
+            ['thinking', 'enable_thinking', 'thinking_budget', 'reasoning_effort', 'reasoning'].forEach(key => {
+                if (Object.prototype.hasOwnProperty.call(payload, key)) delete payload[key];
+            });
+        }
+
+        isThinkingControlError(error) {
+            const message = normalizeText(error?.message || error || '');
+            return /(?:400|422|请求参数|参数|parameter|unsupported|not support|unknown|invalid|extra|thinking|enable_thinking|thinking_budget|reasoning_effort|reasoning)/i.test(message);
         }
 
         normalizeMessageContent(value) {
@@ -2610,23 +3225,180 @@ ${optionsText}`;
             return '';
         }
 
+        splitDataUrl(dataUrl) {
+            const match = String(dataUrl || '').match(/^data:([^;,]+)?;base64,(.*)$/i);
+            if (!match) return null;
+            return { mediaType: match[1] || 'image/jpeg', data: match[2] || '' };
+        }
+
+        anthropicContentFromOpenAI(content) {
+            if (typeof content === 'string') return content;
+            if (!Array.isArray(content)) return this.normalizeMessageContent(content);
+            const blocks = [];
+            for (const part of content) {
+                if (typeof part === 'string') {
+                    if (normalizeText(part)) blocks.push({ type: 'text', text: part });
+                    continue;
+                }
+                const type = normalizeText(part?.type).toLowerCase();
+                if (type === 'text') {
+                    const text = String(part?.text ?? part?.content ?? '');
+                    if (normalizeText(text)) blocks.push({ type: 'text', text });
+                    continue;
+                }
+                if (type === 'image_url') {
+                    const url = normalizeText(part?.image_url?.url || part?.url || '');
+                    if (!url) continue;
+                    const data = this.splitDataUrl(url);
+                    if (data) {
+                        blocks.push({
+                            type: 'image',
+                            source: { type: 'base64', media_type: data.mediaType, data: data.data },
+                        });
+                    } else {
+                        blocks.push({
+                            type: 'image',
+                            source: { type: 'url', url },
+                        });
+                    }
+                    continue;
+                }
+                const text = this.normalizeMessageContent(part);
+                if (normalizeText(text)) blocks.push({ type: 'text', text });
+            }
+            return blocks.length ? blocks : '';
+        }
+
+        async chatAnthropic(messages, { jsonMode = false } = {}) {
+            const provider = this.resolveProviderSettings();
+            const systemBlocks = [];
+            const convertedMessages = [];
+            for (const message of messages || []) {
+                const role = normalizeText(message?.role || 'user').toLowerCase();
+                if (role === 'system') {
+                    const text = this.normalizeMessageContent(message.content);
+                    if (text) systemBlocks.push(text);
+                    continue;
+                }
+                convertedMessages.push({
+                    role: role === 'assistant' ? 'assistant' : 'user',
+                    content: this.anthropicContentFromOpenAI(message?.content),
+                });
+            }
+            if (!convertedMessages.length) throw new Error('Anthropic 请求缺少 messages');
+            const payload = {
+                model: provider.model,
+                messages: convertedMessages,
+                max_tokens: 2048,
+                temperature: this.getProviderTemperature(provider),
+            };
+            if (systemBlocks.length) {
+                payload.system = systemBlocks.join('\n\n');
+            }
+            if (jsonMode) {
+                payload.system = `${payload.system ? `${payload.system}\n\n` : ''}请以 JSON 对象格式回复。`;
+            }
+
+            const describeHttpError = (status, statusText, bodyText = '') => {
+                let detail = '';
+                try {
+                    const parsed = JSON.parse(bodyText || '{}');
+                    detail = normalizeText(parsed?.error?.message || parsed?.message || '');
+                } catch { /* ignore */ }
+                const statusHints = {
+                    400: '请求参数或模型配置不正确',
+                    401: 'API Key 无效或未授权',
+                    402: 'API 账户余额不足',
+                    403: '请求被服务端拒绝',
+                    404: 'API 地址或模型名称不存在',
+                    429: '请求过于频繁，请调大填充间隔',
+                    500: 'AI 服务内部错误',
+                    503: 'AI 服务暂时繁忙',
+                };
+                const hint = detail || statusHints[status] || statusText || '未知错误';
+                return `API 请求失败（${status || '网络错误'}）：${hint}`;
+            };
+
+            const readContent = data => {
+                if (data?.error) throw new Error(data.error.message || `API 错误：${JSON.stringify(data.error)}`);
+                const content = Array.isArray(data?.content)
+                    ? data.content.map(part => part?.text || '').filter(Boolean).join('\n').trim()
+                    : normalizeText(data?.content || data?.completion || '');
+                if (content) return content;
+                throw new Error(`API 返回空内容（模型：${data?.model || provider.model}）`);
+            };
+
+            const thinkingFields = this.applyThinkingControlToPayload(payload, provider);
+
+            const requestOnce = requestPayload => new Promise((resolve, reject) => {
+                const headers = {
+                    'Content-Type': 'application/json',
+                    'x-api-key': provider.apiKey,
+                    'anthropic-version': '2023-06-01',
+                };
+                if (typeof GM_xmlhttpRequest === 'undefined') {
+                    fetch(provider.url, { method: 'POST', headers, body: JSON.stringify(requestPayload) })
+                        .then(async response => {
+                            const text = await response.text();
+                            if (!response.ok) throw new Error(describeHttpError(response.status, response.statusText, text));
+                            return JSON.parse(text);
+                        })
+                        .then(data => resolve(readContent(data)))
+                        .catch(reject);
+                    return;
+                }
+                GM_xmlhttpRequest({
+                    method: 'POST',
+                    url: provider.url,
+                    headers,
+                    data: JSON.stringify(requestPayload),
+                    onload(response) {
+                        const status = Number(response.status) || 0;
+                        if (status < 200 || status >= 300) {
+                            reject(new Error(describeHttpError(status, response.statusText, response.responseText)));
+                            return;
+                        }
+                        try {
+                            const data = JSON.parse(response.responseText);
+                            resolve(readContent(data));
+                        } catch (error) {
+                            reject(error instanceof Error
+                                ? error
+                                : new Error(`API 响应解析失败：${response.responseText?.slice(0, 160)}`));
+                        }
+                    },
+                    onerror() { reject(new Error('API 网络请求失败，请检查 API 地址、代理和网络连接')); },
+                    ontimeout() { reject(new Error('API 请求超时，请稍后重试或调大答题间隔')); },
+                    timeout: 45000,
+                });
+            });
+
+            try {
+                return await requestOnce(payload);
+            } catch (error) {
+                if (thinkingFields.length && this.isThinkingControlError(error)) {
+                    const fallbackPayload = { ...payload };
+                    this.removeThinkingControlFromPayload(fallbackPayload);
+                    console.warn('[CXAE] 当前模型/接口不接受思考控制参数，已去掉参数重试。', error);
+                    return requestOnce(fallbackPayload);
+                }
+                throw error;
+            }
+        }
+
         async chat(messages, { jsonMode = false, retryWithoutJson = true } = {}) {
             const provider = this.resolveProviderSettings();
+            if (provider.protocol === 'anthropic') {
+                return this.chatAnthropic(messages, { jsonMode });
+            }
             const payload = {
                 model: provider.model,
                 messages,
-                temperature: 0.1,
+                temperature: this.getProviderTemperature(provider),
                 max_tokens: 2048,
             };
 
-            // DeepSeek V4 支持 thinking 参数。默认关闭，保证答题速度和最终答案稳定；
-            // 在设置中打开后，会请求模型进入思考模式，但仍要求最终只输出答案。
-            if (provider.isOfficialDeepSeek && /^deepseek-v4-/i.test(provider.model)) {
-                payload.thinking = { type: provider.aiThinkingEnabled ? 'enabled' : 'disabled' };
-                if (provider.aiThinkingEnabled) {
-                    payload.max_tokens = Math.max(payload.max_tokens, 4096);
-                }
-            }
+            const thinkingFields = this.applyThinkingControlToPayload(payload, provider);
             if (jsonMode) payload.response_format = { type: 'json_object' };
 
             const describeHttpError = (status, statusText, bodyText = '') => {
@@ -2739,7 +3511,22 @@ ${optionsText}`;
             try {
                 return await requestOnce(payload);
             } catch (error) {
-                // DeepSeek 官方说明 JSON Output 偶尔会返回空 content。遇到这种情况自动去掉
+                if (thinkingFields.length && this.isThinkingControlError(error)) {
+                    const fallbackPayload = { ...payload };
+                    this.removeThinkingControlFromPayload(fallbackPayload);
+                    console.warn('[CXAE] 当前模型/接口不接受思考控制参数，已去掉参数重试。', error);
+                    try {
+                        return await requestOnce(fallbackPayload);
+                    } catch (fallbackError) {
+                        if (jsonMode && retryWithoutJson && /空内容|有效答案|长度上限/i.test(fallbackError?.message || '')) {
+                            delete fallbackPayload.response_format;
+                            return requestOnce(fallbackPayload);
+                        }
+                        throw fallbackError;
+                    }
+                }
+
+                // 部分接口 JSON Output 偶尔会返回空 content。遇到这种情况自动去掉
                 // response_format 重试一次，避免整道题直接失败。
                 if (jsonMode && retryWithoutJson && /空内容|有效答案|长度上限/i.test(error?.message || '')) {
                     const fallbackPayload = { ...payload };
@@ -2842,8 +3629,7 @@ ${optionsText}`;
             return { answer: '', confidence: 0 };
         }
 
-        async answerQuestion({ type, question, options }) {
-            const prompt = this.buildPrompt({ type, question, options });
+        async runTextAnswer(prompt, type) {
             const messages = [
                 { role: 'system', content: '你是考试答题助手。只输出最终答案本身，不要解释，不要 Markdown，不要 JSON。' },
                 { role: 'user', content: prompt },
@@ -2859,7 +3645,123 @@ ${optionsText}`;
                 { role: 'user', content: `${prompt}\n\n再次强调：只输出最终答案。` },
             ];
             content = await this.chat(retryMessages, { jsonMode: false });
-            result = this.parseAIResponse(content, type);
+            return this.parseAIResponse(content, type);
+        }
+
+        async runVisionAnswer(prompt, type, imageDataUrls) {
+            const messages = [
+                { role: 'system', content: '你是考试答题助手。请结合题目文字、选项和图片作答。只输出最终答案本身，不要解释，不要 Markdown，不要 JSON。' },
+                { role: 'user', content: this.buildVisionUserContent(prompt, imageDataUrls) },
+            ];
+
+            let content = await this.chat(messages, { jsonMode: false });
+            let result = this.parseAIResponse(content, type);
+            if (normalizeText(result.answer)) return result;
+
+            const retryMessages = [
+                { role: 'system', content: '只返回答案，不要解释。' },
+                { role: 'user', content: this.buildVisionUserContent(`${prompt}\n\n再次强调：只输出最终答案。`, imageDataUrls) },
+            ];
+            content = await this.chat(retryMessages, { jsonMode: false });
+            return this.parseAIResponse(content, type);
+        }
+
+        buildImageWarning(imageList, mode, ocrWarning = '', visionWarning = '') {
+            if (!imageList.length) return '';
+            const pieces = [];
+            if (mode === 'text') pieces.push('已按纯文本处理，图片未参与识别');
+            if (ocrWarning) pieces.push(ocrWarning);
+            if (visionWarning) pieces.push(visionWarning);
+            return pieces.filter(Boolean).join('；');
+        }
+
+        async answerQuestion({ type, question, options, images = [] }) {
+            const settings = this.getSettings();
+            const provider = this.resolveProviderSettings();
+            const imageList = this.normalizeImageList(images);
+            const mode = this.resolveImageMode(settings.imageQuestionMode);
+            const hasImages = imageList.length > 0;
+            let imageModeUsed = 'text';
+            let imageWarning = '';
+            let ocrText = '';
+            let ocrWarning = '';
+            let visionWarning = '';
+
+            const shouldRunOcr = hasImages && (
+                mode === 'ocr' ||
+                mode === 'ocr-vision' ||
+                (mode === 'auto' && !this.shouldTryVision(provider, mode))
+            );
+
+            if (shouldRunOcr) {
+                const ocr = await this.collectLocalOcrText(imageList, settings);
+                ocrText = normalizeText(ocr.text || '');
+                ocrWarning = (ocr.warnings || []).join('；');
+                if (ocrText) imageModeUsed = 'ocr';
+            }
+
+            const visionPrompt = this.buildPrompt({
+                type,
+                question,
+                options,
+                imageOcrText: ocrText,
+                imageCount: hasImages ? imageList.length : 0,
+            });
+
+            const shouldRunVision = hasImages && this.shouldTryVision(provider, mode);
+            if (shouldRunVision) {
+                const failures = [];
+                let unsupported = false;
+                for (const strategy of this.getVisionTransportStrategies(provider, settings)) {
+                    try {
+                        const prepared = await this.prepareVisionInputs(imageList, provider, settings, strategy);
+                        if (!prepared.sources.length) {
+                            throw new Error(prepared.errors.length ? prepared.errors.join('；') : '没有可发送给多模态模型的图片');
+                        }
+                        const result = await this.runVisionAnswer(visionPrompt, type, prepared.sources);
+                        this.setVisionCache(provider, true, strategy);
+                        result.imageModeUsed = ocrText ? `ocr+vision-${strategy}` : `vision-${strategy}`;
+                        const prepareWarning = [
+                            prepared.truncated ? `仅发送前 ${prepared.sources.length} 张图片` : '',
+                            prepared.errors.length ? `部分图片未发送：${prepared.errors.join('；')}` : '',
+                            ocrWarning,
+                            strategy === 'url' && this.isAgnesProvider(provider) ? 'Agnes 使用图片 URL 识别；若超星图片需登录，模型可能无法读取，可在设置中改用 Base64 或 OCR' : '',
+                        ].filter(Boolean).join('；');
+                        result.imageWarning = prepareWarning;
+                        if (normalizeText(result.answer)) return result;
+                        failures.push(`${strategy}：多模态模型未返回可识别答案`);
+                    } catch (error) {
+                        const message = error?.message || String(error);
+                        if (this.isVisionUnsupportedError(error)) unsupported = true;
+                        failures.push(`${strategy}：${message}`);
+                        console.warn(`[CXAE] 多模态识图失败（${strategy}），尝试其他方式。`, error);
+                    }
+                }
+                if (unsupported) this.setVisionCache(provider, false, failures.join('；'));
+                visionWarning = `多模态识图失败：${failures.join('；')}`;
+                if (mode === 'vision') {
+                    throw new Error(`${visionWarning}。可在设置中改为“自动”或“OCR 识别图片文字”。`);
+                }
+                console.warn('[CXAE] 多模态识图全部失败，尝试降级。', visionWarning);
+            }
+
+            const textPrompt = this.buildPrompt({
+                type,
+                question,
+                options,
+                imageOcrText: ocrText,
+                imageCount: ocrText ? imageList.length : 0,
+            });
+            let result = await this.runTextAnswer(textPrompt, type);
+            result.imageModeUsed = ocrText ? 'ocr' : 'text';
+            if (hasImages) {
+                if (ocrText) {
+                    imageWarning = [ocrWarning, visionWarning].filter(Boolean).join('；');
+                } else {
+                    imageWarning = this.buildImageWarning(imageList, mode, ocrWarning, visionWarning) || '图片未成功识别，已按题目文字和选项作答';
+                }
+            }
+            result.imageWarning = imageWarning;
             return result;
         }
 
@@ -2872,6 +3774,33 @@ ${optionsText}`;
             ];
             const content = await this.chat(messages, { jsonMode: false });
             return Boolean(normalizeText(content));
+        }
+
+        async testVisionSupport() {
+            const settings = this.getSettings();
+            if (!normalizeText(settings.aiApiKey)) throw new Error('未配置 API Key');
+            const provider = this.resolveProviderSettings();
+            const tinyPng = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lw7nWQAAAABJRU5ErkJggg==';
+            const publicTestImage = 'https://dummyimage.com/96x48/ffffff/000000.png&text=OK';
+            const prompt = '这是一张用于测试接口是否接受图片输入的测试图。请只回复：识图成功';
+            const failures = [];
+            for (const strategy of this.getVisionTransportStrategies(provider, settings)) {
+                const sources = strategy === 'url' ? [publicTestImage] : [tinyPng];
+                try {
+                    const messages = [
+                        { role: 'system', content: '只按用户要求回复固定文字。' },
+                        { role: 'user', content: this.buildVisionUserContent(prompt, sources) },
+                    ];
+                    const content = await this.chat(messages, { jsonMode: false });
+                    this.setVisionCache(provider, true, strategy);
+                    return { ok: Boolean(normalizeText(content)), strategy };
+                } catch (error) {
+                    failures.push(`${strategy}：${error?.message || String(error)}`);
+                }
+            }
+            const message = failures.join('；') || '该模型不支持图片输入';
+            this.setVisionCache(provider, false, message);
+            throw new Error(message);
         }
     }
 
@@ -3061,11 +3990,16 @@ ${optionsText}`;
 
                     try {
                         const liveItem = this.adapter.parseQuestion(node, Number(item.order) || index + 1) || item;
+                        const images = Array.from(new Set([...(liveItem.images || []), ...(item.images || [])]));
                         const result = await this.aiClient.answerQuestion({
                             type: liveItem.type || item.type,
                             question: liveItem.question || item.question,
                             options: liveItem.options?.length ? liveItem.options : item.options,
+                            images,
                         });
+                        if (result.imageWarning) {
+                            this.report(`第 ${index + 1} 题图片提示：${result.imageWarning}`, 'active');
+                        }
 
                         if (!normalizeText(result.answer)) {
                             failed += 1;
@@ -3252,11 +4186,16 @@ ${optionsText}`;
                     const item = { ...target.item, order };
                     try {
                         const liveItem = this.adapter.parseQuestion(target.node, order) || item;
+                        const images = Array.from(new Set([...(liveItem.images || []), ...(item.images || [])]));
                         const result = await this.aiClient.answerQuestion({
                             type: liveItem.type || item.type,
                             question: liveItem.question || item.question,
                             options: liveItem.options?.length ? liveItem.options : item.options,
+                            images,
                         });
+                        if (result.imageWarning) {
+                            this.report(`第 ${order} 题图片提示：${result.imageWarning}`, 'active');
+                        }
                         if (!normalizeText(result.answer)) {
                             task.failed += 1;
                             task.lastError = `第 ${order} 题：AI 未返回可识别答案`;
@@ -3412,7 +4351,7 @@ ${optionsText}`;
             style.textContent = `
                 :host { all: initial; }
                 * { box-sizing: border-box; }
-                button, input { font: inherit; }
+                button, input, select { font: inherit; }
                 .launcher {
                     position: fixed; right: 20px; bottom: 20px; z-index: 2147483646;
                     width: 54px; height: 54px; border: 0; border-radius: 16px;
@@ -3602,8 +4541,15 @@ ${optionsText}`;
                             <div style="margin-top: 12px; padding-top: 10px; border-top: 1px dashed #cbd5e1;">
                                 <div style="color: #334155; font-size: 12px; font-weight: 760; margin-bottom: 8px;">AI 配置</div>
                                 <div style="margin-bottom: 8px;">
+                                    <label class="input-label">服务商预设</label>
+                                    <select class="input-field" data-setting="aiProviderPreset">
+                                        ${this.providerOptionsHtml()}
+                                    </select>
+                                    <div class="ai-status" data-role="provider-note" style="margin-top: 4px; line-height: 1.45;">选择预设可自动填写 API 地址、模型和图片模式。</div>
+                                </div>
+                                <div style="margin-bottom: 8px;">
                                     <label class="input-label">API Key</label>
-                                    <input class="input-field" type="password" data-setting="aiApiKey" placeholder="输入你的 DeepSeek API Key">
+                                    <input class="input-field" type="password" data-setting="aiApiKey" placeholder="输入你的 API Key">
                                 </div>
                                 <div class="input-row">
                                     <div style="flex: 1;">
@@ -3611,7 +4557,16 @@ ${optionsText}`;
                                         <input class="input-field" type="text" data-setting="aiApiBase" placeholder="https://api.deepseek.com">
                                     </div>
                                 </div>
-                                <div class="input-row">
+                                <div class="input-row" style="margin-top: 8px;">
+                                    <div style="flex: 1;">
+                                        <label class="input-label">接口类型</label>
+                                        <select class="input-field" data-setting="aiApiProtocol">
+                                            <option value="openai">OpenAI 兼容 /chat/completions</option>
+                                            <option value="anthropic">Anthropic Claude /messages</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="input-row" style="margin-top: 8px;">
                                     <div style="flex: 1;">
                                         <label class="input-label">模型</label>
                                         <input class="input-field" type="text" data-setting="aiModel" placeholder="deepseek-v4-flash">
@@ -3619,7 +4574,34 @@ ${optionsText}`;
                                     <button class="btn-sm" type="button" data-action="test-ai">测试连接</button>
                                 </div>
                                 <div class="settings" style="margin-top: 8px;">
-                                    <label class="setting"><span>DeepSeek V4 打开思考（更慢、更耗额度）</span><span class="switch"><input type="checkbox" data-setting="aiThinkingEnabled"><span></span></span></label>
+                                    <label class="setting"><span>打开思考（支持时更慢、更耗额度）</span><span class="switch"><input type="checkbox" data-setting="aiThinkingEnabled"><span></span></span></label>
+                                    <div class="ai-status" style="margin-top: 4px; line-height: 1.45;">会按服务商自动使用 DeepSeek/Qwen/Claude/MiniMax/GLM/OpenAI 等思考参数；接口不支持时会去掉参数重试。</div>
+                                </div>
+                                <div style="margin-top: 8px;">
+                                    <label class="input-label">图片题处理</label>
+                                    <select class="input-field" data-setting="imageQuestionMode">
+                                        <option value="auto">自动（推荐）</option>
+                                        <option value="text">仅文字，不处理图片</option>
+                                        <option value="ocr">OCR 识别图片文字</option>
+                                        <option value="vision">多模态识图</option>
+                                        <option value="ocr-vision">OCR + 多模态</option>
+                                    </select>
+                                    <div class="ai-status" style="margin-top: 4px; line-height: 1.45;">自动模式会避开官方 DeepSeek 的图片输入；Agnes/OpenAI-compatible 接口会尝试多模态，失败后降级。</div>
+                                </div>
+                                <div style="margin-top: 8px;">
+                                    <label class="input-label">图片发送方式</label>
+                                    <select class="input-field" data-setting="imageSendMode">
+                                        <option value="auto">自动（推荐）</option>
+                                        <option value="base64">Base64（登录图片更稳）</option>
+                                        <option value="url">原图 URL（Agnes 推荐）</option>
+                                    </select>
+                                </div>
+                                <div class="input-row" style="margin-top: 8px;">
+                                    <div style="flex: 1;">
+                                        <label class="input-label">最多发送图片数</label>
+                                        <input class="input-field" type="number" data-setting="imageMaxCount" min="1" max="8" placeholder="3">
+                                    </div>
+                                    <button class="btn-sm" type="button" data-action="test-vision">测试识图</button>
                                 </div>
                                 <div style="margin-top: 4px;">
                                     <label class="input-label">填充间隔（毫秒）</label>
@@ -3650,43 +4632,118 @@ ${optionsText}`;
             return this.shadow?.querySelector(selector) || null;
         }
 
+        providerOptionsHtml() {
+            return AI_PROVIDER_PRESETS.map(preset => `<option value="${preset.id}">${preset.name}</option>`).join('');
+        }
+
+        updateProviderNote() {
+            const settings = this.settingsStore.load();
+            const preset = getAiProviderPreset(settings.aiProviderPreset || 'custom');
+            const note = this.$('[data-role="provider-note"]');
+            if (note) note.textContent = preset.note || '可手动填写任意 OpenAI-compatible 配置。';
+        }
+
+        applyProviderPreset(id) {
+            const preset = getAiProviderPreset(id);
+            const settings = this.settingsStore.load();
+            settings.aiProviderPreset = preset.id;
+            if (preset.id !== 'custom') {
+                settings.aiApiProtocol = preset.protocol || 'openai';
+                settings.aiApiBase = preset.apiBase || settings.aiApiBase;
+                settings.aiModel = preset.model || settings.aiModel;
+                settings.imageQuestionMode = preset.imageQuestionMode || settings.imageQuestionMode || 'auto';
+                settings.imageSendMode = preset.imageSendMode || settings.imageSendMode || 'auto';
+            }
+            this.settingsStore.save(settings);
+            this.applySettings();
+            this.updateProviderNote();
+            if (preset.id !== 'custom') {
+                this.setAiStatus(`已套用：${preset.name}。请确认 API Key 和模型是否已在控制台开通。`, 'active');
+            }
+        }
+
+        markPresetCustomForManualEdit(key) {
+            if (!['aiApiBase', 'aiModel', 'aiApiProtocol'].includes(key)) return;
+            const settings = this.settingsStore.load();
+            if ((settings.aiProviderPreset || 'custom') === 'custom') return;
+            settings.aiProviderPreset = 'custom';
+            this.settingsStore.save(settings);
+            const presetInput = this.$('[data-setting="aiProviderPreset"]');
+            if (presetInput) presetInput.value = 'custom';
+            this.updateProviderNote();
+        }
+
         bind() {
             this.$('.launcher').addEventListener('click', () => this.toggle());
             this.$('[data-action="close"]').addEventListener('click', () => this.close());
             this.shadow.querySelectorAll('[data-action]').forEach(button => {
                 const action = button.dataset.action;
                 if (action === 'close') return;
-                button.addEventListener('click', () => this.handlers[action]?.());
+                button.addEventListener('click', () => {
+                    this.saveSettingsFromInputs();
+                    this.handlers[action]?.();
+                });
             });
 
             this.shadow.querySelectorAll('[data-setting]').forEach(input => {
                 const eventType = (input.type === 'text' || input.type === 'password' || input.type === 'number') ? 'change' : 'change';
                 input.addEventListener(eventType, () => {
                     const settings = this.settingsStore.load();
+                    const key = input.dataset.setting;
                     if (input.type === 'checkbox') {
-                        settings[input.dataset.setting] = input.checked;
+                        settings[key] = input.checked;
                     } else if (input.type === 'number') {
-                        settings[input.dataset.setting] = Number(input.value) || undefined;
+                        settings[key] = Number(input.value) || undefined;
                     } else {
-                        settings[input.dataset.setting] = input.value;
+                        settings[key] = input.value;
                     }
                     this.settingsStore.save(settings);
+                    if (key === 'aiProviderPreset') {
+                        this.applyProviderPreset(input.value);
+                        return;
+                    }
+                    this.markPresetCustomForManualEdit(key);
+                    this.updateProviderNote();
                     this.handlers.settings?.(settings);
                 });
                 // 文本输入也监听 blur，确保值保存
                 if (input.type === 'text' || input.type === 'password' || input.type === 'number') {
                     input.addEventListener('blur', () => {
                         const settings = this.settingsStore.load();
+                        const key = input.dataset.setting;
                         if (input.type === 'number') {
-                            settings[input.dataset.setting] = Number(input.value) || undefined;
+                            settings[key] = Number(input.value) || undefined;
                         } else {
-                            settings[input.dataset.setting] = input.value;
+                            settings[key] = input.value;
                         }
                         this.settingsStore.save(settings);
+                        this.markPresetCustomForManualEdit(key);
                     });
                 }
             });
             this.bindStudyControls();
+        }
+
+        saveSettingsFromInputs() {
+            if (!this.shadow) return this.settingsStore.load();
+            const settings = this.settingsStore.load();
+            this.shadow.querySelectorAll('[data-setting]').forEach(input => {
+                const key = input.dataset.setting;
+                if (!key) return;
+                if (input.type === 'checkbox') {
+                    settings[key] = input.checked;
+                } else if (input.type === 'number') {
+                    settings[key] = Number(input.value) || undefined;
+                } else {
+                    const value = input.value;
+                    // 点击按钮时先同步当前输入框。API Key 字段若为空，不在这里删除已有 Key，
+                    // 避免密码框被浏览器/脚本管理器清空显示值时误删配置。用户手动清空仍会由 change/blur 保存。
+                    if (key === 'aiApiKey' && !value && settings.aiApiKey) return;
+                    settings[key] = value;
+                }
+            });
+            this.settingsStore.save(settings);
+            return settings;
         }
 
         studyDefaults() {
@@ -3809,6 +4866,7 @@ ${optionsText}`;
                     }
                 }
             });
+            this.updateProviderNote();
             this.applyStudySettings();
         }
 
@@ -4441,6 +5499,17 @@ ${optionsText}`;
         }
     }
 
+    async function handleTestVision() {
+        ui.setAiStatus('正在测试模型是否接受图片输入…', 'active');
+        try {
+            const result = await aiClient.testVisionSupport();
+            const strategyText = result?.strategy === 'url' ? 'URL 图片' : result?.strategy === 'base64' ? 'Base64 图片' : '图片';
+            ui.setAiStatus(`识图测试成功：该接口/模型可接收${strategyText}输入`, 'success');
+        } catch (error) {
+            ui.setAiStatus(`识图测试失败：${error.message || '该模型不支持图片输入'}`, 'error');
+        }
+    }
+
     function mount() {
         const isStudyTopPage = window.top === window && /\/mycourse\/studentstudy/i.test(location.href);
         if (!adapter.hasQuestions() && !isStudyTopPage) return false;
@@ -4456,6 +5525,7 @@ ${optionsText}`;
         ui.on('fill-collected', () => handleFillCollected());
         ui.on('stop-fill', () => autoFiller.stop());
         ui.on('test-ai', () => handleTestAi());
+        ui.on('test-vision', () => handleTestVision());
         ui.on('settings', () => ui.refresh());
         collector.autoResume();
         autoFiller.autoResume();
@@ -4539,7 +5609,7 @@ ${optionsText}`;
     const MODULE = Object.freeze({
         id: 'cx-study-autoplayer',
         name: '学习通超级工具·自动刷课',
-        version: '1.5.1',
+        version: '1.5.5-image-ai',
         settingsKey: 'CX_STUDY_AUTOPLAYER_SETTINGS',
     });
 

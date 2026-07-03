@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.5.5-image-ai - 2026-07-03
+
+### Added
+
+- **服务商预设**：一键填入 API 地址、接口类型、模型名与图片处理模式；手动改地址/模型/接口类型会自动回到「自定义」；
+- 新增 Agnes、DeepSeek 官方、阿里百炼/千问 VL、火山方舟、腾讯混元、智谱 GLM、Kimi（中国区/Global）、MiniMax、OpenAI、Claude 官方、OpenRouter 等预设；
+- **多模态图片题**：图片题默认优先用 Base64 发送，避免超星图片 URL 被第三方模型服务端 403；支持「自动 / 仅文字 / OCR / 多模态识图 / OCR+多模态」模式与「自动 / Base64 / 原图 URL」发送方式；
+- 图片本地 OCR（基于浏览器 `TextDetector`）、图片压缩（超过限制自动缩放至 1280 边、JPEG 0.72）、视觉能力缓存（按 `apiBase|model` 记忆 7 天）；
+- **Anthropic Claude `/messages` 协议支持**：新增 `chatAnthropic`，OpenAI 多模态内容块自动转换为 Anthropic `image`/`text` 块；
+- **通用「打开思考」开关**：按服务商自动套用 DeepSeek V4 / Qwen(`enable_thinking`+`thinking_budget`) / Claude / MiniMax / GLM / 火山方舟 / OpenAI `reasoning_effort` / OpenRouter `reasoning` 等思考参数；接口不支持时自动去掉参数重试；
+- 常见 OpenAI-compatible 地址容错：`dashscope.../compatible-mode` 自动补 `/v1`，moonshot/openai/minimax/agnes/hunyuan 等少填 `/v1` 时自动补齐；
+- 「测试识图」按钮：用 1×1 测试图探测接口是否接受图片输入并缓存结果；
+- Kimi K2 系列接口严格要求 `temperature=1` 的特例处理；
+- 采集与答题流程透传 `images`，AI 作答结果附带 `imageModeUsed` / `imageWarning` 提示。
+
+### Changed
+
+- 三处版本号统一为 `1.5.5-image-ai`（header、`APP.version`、`StudyAutoPlayer.MODULE.version`）；
+- `answerQuestion` 签名扩展为 `{ type, question, options, images }`，原内部流程拆分为 `runTextAnswer` / `runVisionAnswer`，识图失败后自动降级到文字+OCR；
+- 设置面板新增「服务商预设」「接口类型」「图片题处理」「图片发送方式」「最多发送图片数」等控件，按钮点击前先同步输入框（修复密码框被清空时误删 API Key）；
+- DeepSeek V4 思考逻辑收敛进通用 `applyThinkingControlToPayload` / `removeThinkingControlFromPayload`，并增加 `isThinkingControlError` 自动重试；
+- API Key 占位文案由「DeepSeek API Key」改为通用「API Key」。
+
 ## 1.5.1 - 2026-06-27
 
 ### Added
