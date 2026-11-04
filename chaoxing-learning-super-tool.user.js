@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通超级工具
 // @namespace    https://github.com/zenghaolinz/chaoxing-learning-super-tool
-// @version      1.5.6-image-ai-tw
+// @version      1.5.7-image-ai-tw
 // @description  学习通超级工具：题目采集/导出/AI答题/回填 + 视频自动播放、保活、自动下一节、章节测验 AI 作答，统一浮窗开关
 // @author       zenghaolinz
 // @license      MIT
@@ -42,7 +42,7 @@
     const APP = Object.freeze({
         id: 'cx-answer-exporter',
         name: '学习通超级工具',
-        version: '1.5.6-image-ai-tw',
+        version: '1.5.7-image-ai-tw',
         storageVersion: 1,
         sessionPrefix: 'CXAE_SESSION_',
         settingsKey: 'CXAE_SETTINGS',
@@ -1159,6 +1159,23 @@
         }
 
         extractOptions(question) {
+            // 考试页显示答案后，正确选项的字母会被对勾替换，但 data 属性仍保留。
+            // 逐个读取选项容器，避免分行兜底把缺少可见字母的正文并入前一选项。
+            const choiceElements = Array.from(question.querySelectorAll(
+                '.stem_answer .answerBg, .stem_answer [role="radio"], .stem_answer [role="checkbox"]'
+            ));
+            const structuredOptions = choiceElements.map(element => {
+                const labelNode = element.querySelector('.num_option[data]');
+                const contentNode = element.querySelector('.answer_p');
+                const letter = this.normalizeOptionLetter(
+                    labelNode?.getAttribute('data') || labelNode?.textContent || ''
+                );
+                if (!/^[A-H]$/.test(letter) || !contentNode) return null;
+                const content = normalizeText(contentNode.innerText || contentNode.textContent);
+                return `${letter}. ${content}`.trim();
+            });
+            if (structuredOptions.length && structuredOptions.every(Boolean)) return structuredOptions;
+
             const selectors = [
                 '.mark_letter li',
                 '.answerList li',
@@ -1207,6 +1224,7 @@
                         if (nextLetter) break;
                         if (/^第\s*\d+\s*空/.test(lines[cursor])) break;
                         if (/^(我的答案|正确答案|正確答案|参考答案|參考答案|标准答案|標準答案|答案解析|答案詳解|题目解析|題目解析)/.test(lines[cursor])) break;
+                        if (/^(?:(?:显示|顯示)\s*(?:(?:正确|正確)\s*)?答案|[上下]一[题題页頁]|标记|標記|难易度|難易度|知识点|知識點)(?:\s|[:：]|$)/.test(lines[cursor])) break;
                         parts.push(lines[cursor]);
                     }
 
@@ -5638,7 +5656,7 @@ ${optionsText}`;
     const MODULE = Object.freeze({
         id: 'cx-study-autoplayer',
         name: '学习通超级工具·自动刷课',
-        version: '1.5.6-image-ai-tw',
+        version: '1.5.7-image-ai-tw',
         settingsKey: 'CX_STUDY_AUTOPLAYER_SETTINGS',
     });
 
