@@ -69,7 +69,9 @@ test('detached HTML parsing restores the correct option label without running sc
     assert.equal(context.untrustedPageRan, undefined);
     assert.throws(() => adapter.parseBatchPage(page(3), 2, baseUrl), /题号不匹配/);
     assert.throws(() => adapter.parseBatchPage('<html>请登录</html>', 2, baseUrl), /题号不匹配/);
-    assert.throws(() => adapter.parseBatchPage(page(2, { answer: '' }), 2, baseUrl), /未返回正确答案/);
+    const missing = adapter.parseBatchPage(page(2, { answer: '' }), 2, baseUrl);
+    assert.equal(missing.answer, '');
+    assert.match(missing.missingAnswerReason, /未提供正确答案/);
 });
 
 test('hidden letters remain independent at every position, including multi-select and image-only options', () => {
@@ -136,6 +138,50 @@ test('existing answers are preserved and only unfinished questions are fetched',
     assert.deepEqual(requests, [2, 3]);
     assert.equal(h.store.load().items[0].question, '已保存题目');
     assert.equal(h.store.load().skipped.length, 0);
+});
+
+test('missing answers at the first, middle, and last questions are saved without stopping batch collection', async () => {
+    const requests = [];
+    const h = harness({ total: 5, fetchImpl: async url => {
+        const order = Number(new URL(url).searchParams.get('start')) + 1;
+        requests.push(order);
+        return { ok: true, url, text: async () => page(order, { answer: [1, 3, 5].includes(order) ? '' : 'D' }) };
+    }});
+    await h.collector.startBatch();
+    const session = h.store.load();
+    assert.equal(session.phase, 'completed');
+    assert.equal(session.items.length, 5);
+    assert.deepEqual(requests.slice().sort((a, b) => a - b), [1, 2, 3, 4, 5]);
+    assert.deepEqual(Array.from(session.skipped, item => item.order).sort((a, b) => a - b), [1, 3, 5]);
+    for (const item of session.items) {
+        assert.equal(item.options.length, 4);
+        assert.equal(item.answerStatus, [1, 3, 5].includes(item.order) ? 'missing' : 'answered');
+    }
+    assert.equal(h.store.stats(session).processedCount, 5);
+    assert.equal(h.store.stats(session).answerCount, 2);
+});
+
+test('an all-unanswered paper completes with its questions and options intact', async () => {
+    const h = harness({ total: 3, fetchImpl: async url => ({
+        ok: true, url, text: async () => page(Number(new URL(url).searchParams.get('start')) + 1, { answer: '' }),
+    }) });
+    await h.collector.startBatch();
+    const session = h.store.load();
+    assert.equal(session.phase, 'completed');
+    assert.equal(session.items.length, 3);
+    assert.equal(session.skipped.length, 3);
+    assert.equal(h.store.stats(session).answerCount, 0);
+});
+
+test('missing answer fields and explicit unavailable placeholders do not become fake answers', () => {
+    const { adapter } = harness();
+    for (const answer of ['暂无正确答案', '暫無答案', '答案未公布', '未提供答案']) {
+        const item = adapter.parseBatchPage(page(2, { answer }), 2, baseUrl);
+        assert.equal(item.answer, '');
+        assert.equal(item.options.length, 4);
+    }
+    const withoutField = page(2).replace(/<div class="eye_answer">.*?<\/div><\/div>/, '');
+    assert.equal(adapter.parseBatchPage(withoutField, 2, baseUrl).answer, '');
 });
 
 test('a failed probe does not fan out requests or mark a wrong page as processed', async () => {

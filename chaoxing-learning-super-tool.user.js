@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通超级工具
 // @namespace    https://github.com/zenghaolinz/chaoxing-learning-super-tool
-// @version      1.5.8-image-ai-tw
+// @version      1.5.9-image-ai-tw
 // @description  学习通超级工具：题目采集/导出/AI答题/回填 + 视频自动播放、保活、自动下一节、章节测验 AI 作答，统一浮窗开关
 // @author       zenghaolinz
 // @license      MIT
@@ -42,7 +42,7 @@
     const APP = Object.freeze({
         id: 'cx-answer-exporter',
         name: '学习通超级工具',
-        version: '1.5.8-image-ai-tw',
+        version: '1.5.9-image-ai-tw',
         storageVersion: 1,
         sessionPrefix: 'CXAE_SESSION_',
         settingsKey: 'CXAE_SETTINGS',
@@ -1331,7 +1331,10 @@
             );
             // 后台采集只接受明确的答案字段，不能把空答案后的按钮或解析文字当成答案。
             item.answer = this.cleanAnswer(answerNode?.textContent || '');
-            if (!item.answer) throw new Error(`第 ${order} 题未返回正确答案，请改用逐题采集；已读取进度会保留`);
+            if (/^(?:暂无(?:正确)?答案|暫無(?:正確)?答案|未提供(?:正确|正確)?答案|无答案|無答案|答案未公布|答案未公佈|未公布|未公佈|待公布|待公佈)[。.!！]?$/.test(item.answer)) {
+                item.answer = '';
+            }
+            if (!item.answer) item.missingAnswerReason = '后台页面未提供正确答案';
             item.sourceUrl = pageUrl;
             item.images = item.images.map(source => {
                 try { return new URL(source, pageUrl).href; } catch { return source; }
@@ -5293,12 +5296,13 @@ ${optionsText}`;
                         controller.abort();
                         return;
                     }
-                    this.store.addItem(latest, item);
+                    if (item.answer) this.store.addItem(latest, item);
+                    else this.store.addSkipped(latest, item, item.missingAnswerReason || '后台页面未提供正确答案');
                     latest.lastOrder = order;
                     if (!this.store.save(latest)) throw new Error('无法保存采集进度，采集已停止');
                     this.ui.refresh();
                 };
-                // 先验证一题能返回匹配的题号和答案，再开启有限并发。
+                // 先验证一题的题号和题目结构，再开启有限并发；无答案题也保存并继续。
                 if (pending.length) {
                     this.ui.setStatus(`正在验证第 ${pending[0]} 题的后台读取…`, 'active');
                     await readOrder(pending.shift());
@@ -5844,7 +5848,7 @@ ${optionsText}`;
     const MODULE = Object.freeze({
         id: 'cx-study-autoplayer',
         name: '学习通超级工具·自动刷课',
-        version: '1.5.8-image-ai-tw',
+        version: '1.5.9-image-ai-tw',
         settingsKey: 'CX_STUDY_AUTOPLAYER_SETTINGS',
     });
 
