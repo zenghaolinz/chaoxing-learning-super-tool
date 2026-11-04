@@ -1,0 +1,14 @@
+{
+  "name": "chaoxing-learning-super-tool",
+  "private": true,
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check chaoxing-learning-super-tool.user.js"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "devDependencies": {
+    "linkedom": "0.18.15"
+  }
+}

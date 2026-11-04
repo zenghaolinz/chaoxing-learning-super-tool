@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通超级工具
 // @namespace    https://github.com/zenghaolinz/chaoxing-learning-super-tool
-// @version      1.5.7-image-ai-tw
+// @version      1.5.8-image-ai-tw
 // @description  学习通超级工具：题目采集/导出/AI答题/回填 + 视频自动播放、保活、自动下一节、章节测验 AI 作答，统一浮窗开关
 // @author       zenghaolinz
 // @license      MIT
@@ -42,7 +42,7 @@
     const APP = Object.freeze({
         id: 'cx-answer-exporter',
         name: '学习通超级工具',
-        version: '1.5.7-image-ai-tw',
+        version: '1.5.8-image-ai-tw',
         storageVersion: 1,
         sessionPrefix: 'CXAE_SESSION_',
         settingsKey: 'CXAE_SETTINGS',
@@ -54,6 +54,8 @@
         domSettleDelay: 90,
         answerGraceTimeout: 650,
         answerRevealTimeout: 2800,
+        batchConcurrency: 2,
+        batchRequestTimeout: 15000,
         questionNodeCacheTtl: 180,
         navigationCacheTtl: 220,
         questionWaitTimeout: 15000,
@@ -1291,6 +1293,50 @@
                 images: this.extractImages(question),
                 sourceUrl: location.href,
             };
+        }
+
+        supportsBatchCollection(href = location.href) {
+            try {
+                const url = new URL(href);
+                return url.origin === location.origin &&
+                    /(^|\.)chaoxing\.com$/i.test(url.hostname) &&
+                    url.pathname === '/exam-ans/exam/test/reVersionTestStartNew' &&
+                    ['courseId', 'classId', 'tId', 'id', 'start'].every(key => /^\d+$/.test(url.searchParams.get(key) || ''));
+            } catch {
+                return false;
+            }
+        }
+
+        getBatchPageUrl(order, href = location.href) {
+            if (!this.supportsBatchCollection(href)) throw new Error('当前页面不支持后台批量采集，请使用逐题采集');
+            if (!Number.isInteger(order) || order < 1) throw new Error('批量采集题号无效');
+            const url = new URL(href);
+            url.searchParams.set('start', String(order - 1));
+            url.searchParams.set('answeredView', '1');
+            return url.href;
+        }
+
+        parseBatchPage(html, order, pageUrl) {
+            // 只解析返回的 HTML，不挂载页面或执行其中的脚本、表单和自动提交逻辑。
+            const page = new DOMParser().parseFromString(html, 'text/html');
+            const question = Array.from(page.querySelectorAll('.questionLi')).find(node => {
+                const title = this.findTitleNode(node)?.textContent || '';
+                return (this.extractQuestionNumber(title) || this.extractQuestionNumber(node.textContent)) === order;
+            });
+            if (!question) throw new Error(`第 ${order} 题返回页面的题号不匹配，可能登录已失效或分页链接已过期`);
+            const item = this.parseQuestion(question);
+            if (!item || item.order !== order) throw new Error(`第 ${order} 题解析失败`);
+            const answerNode = question.querySelector(
+                '.eye_answer .status1 .yoursanswer, .rightAnswer, .correctAnswer, .right-answer, .correct-answer, .mark_answer .colorGreen'
+            );
+            // 后台采集只接受明确的答案字段，不能把空答案后的按钮或解析文字当成答案。
+            item.answer = this.cleanAnswer(answerNode?.textContent || '');
+            if (!item.answer) throw new Error(`第 ${order} 题未返回正确答案，请改用逐题采集；已读取进度会保留`);
+            item.sourceUrl = pageUrl;
+            item.images = item.images.map(source => {
+                try { return new URL(source, pageUrl).href; } catch { return source; }
+            });
+            return item;
         }
 
         detectMode() {
@@ -4540,7 +4586,9 @@ ${optionsText}`;
                                 <button class="button primary full" type="button" data-action="start">开始 / 继续采集</button>
                                 <button class="button" type="button" data-action="scan">仅扫描当前页</button>
                                 <button class="button" type="button" data-action="pause">暂停并保存</button>
+                                <button class="button full" type="button" data-action="batch" hidden>后台批量采集</button>
                             </div>
+                            <div class="ai-status" data-role="batch-hint" hidden>后台读取题目和正确答案，当前页保持不动；进度自动保存，可随时暂停。</div>
                         </section>
 
                         <section class="card">
@@ -4960,9 +5008,11 @@ ${optionsText}`;
                     ? '长卷同页'
                     : mode === 'paged'
                         ? '逐题换页'
-                        : mode === 'ai-paged'
-                            ? 'AI 逐题'
-                            : '等待识别';
+                        : mode === 'batch'
+                            ? '后台批量'
+                            : mode === 'ai-paged'
+                                ? 'AI 逐题'
+                                : '等待识别';
 
             this.$('[data-role="mode"]').textContent = modeText;
             this.$('[data-role="paper-title"]').textContent = session?.paperTitle || document.title || '等待识别试卷';
@@ -4982,6 +5032,11 @@ ${optionsText}`;
             startButton.disabled = Boolean(session?.active);
             startButton.textContent = session?.items?.length || session?.skipped?.length ? '继续采集' : '开始采集';
             pauseButton.disabled = !session?.active;
+            const batchSupported = this.store.adapter.supportsBatchCollection();
+            const batchButton = this.$('[data-action="batch"]');
+            batchButton.hidden = !batchSupported;
+            batchButton.disabled = Boolean(session?.active);
+            this.$('[data-role="batch-hint"]').hidden = !batchSupported;
             exportButtons.filter(Boolean).forEach(button => { button.disabled = stats.questionCount === 0; });
 
             const skippedList = this.$('[data-role="skipped-list"]');
@@ -5017,6 +5072,7 @@ ${optionsText}`;
             this.ui = ui;
             this.busy = false;
             this.resumeTimer = null;
+            this.batchController = null;
         }
 
         createSession(mode) {
@@ -5091,6 +5147,7 @@ ${optionsText}`;
         }
 
         pause(reason = '用户暂停采集') {
+            this.batchController?.abort();
             const session = this.store.load();
             if (!session) return;
             session.active = false;
@@ -5105,6 +5162,7 @@ ${optionsText}`;
             const session = this.store.load();
             const stats = this.store.stats(session);
             if ((stats.answerCount || stats.skippedCount) && !confirm(`将清空当前试卷的 ${stats.questionCount} 道题（其中 ${stats.answerCount} 道有答案、${stats.skippedCount} 道暂无答案），是否继续？`)) return;
+            this.batchController?.abort();
             this.store.clear();
             this.ui.refresh();
             this.ui.setStatus('已清空当前试卷数据', 'normal');
@@ -5156,6 +5214,123 @@ ${optionsText}`;
                 this.ui.setStatus(error.message || '扫描当前页失败', 'error');
             } finally {
                 this.busy = false;
+            }
+        }
+
+        async fetchBatchQuestion(order, baseUrl, signal) {
+            const url = this.adapter.getBatchPageUrl(order, baseUrl);
+            const requestController = new AbortController();
+            const abortRequest = () => requestController.abort();
+            signal.addEventListener('abort', abortRequest, { once: true });
+            if (signal.aborted) requestController.abort();
+            const timer = setTimeout(abortRequest, APP.batchRequestTimeout);
+            try {
+                const response = await fetch(url, {
+                    method: 'GET', credentials: 'same-origin', cache: 'no-store',
+                    signal: requestController.signal,
+                });
+                if (!response.ok) throw new Error(`第 ${order} 题读取失败（HTTP ${response.status}），已保留进度`);
+                const responseUrl = new URL(response.url);
+                const requestedUrl = new URL(url);
+                if (responseUrl.origin !== requestedUrl.origin || responseUrl.pathname !== requestedUrl.pathname ||
+                    ['courseId', 'classId', 'tId', 'id', 'start'].some(key => responseUrl.searchParams.get(key) !== requestedUrl.searchParams.get(key))) {
+                    throw new Error('后台读取被重定向，请确认登录状态后重试；已读取进度会保留');
+                }
+                const html = await response.text();
+                if (signal.aborted) throw new Error('采集已暂停');
+                return this.adapter.parseBatchPage(html, order, response.url);
+            } catch (error) {
+                if (requestController.signal.aborted && !signal.aborted) {
+                    throw new Error(`第 ${order} 题读取超时，请稍后重试；已读取进度会保留`);
+                }
+                throw error;
+            } finally {
+                clearTimeout(timer);
+                signal.removeEventListener('abort', abortRequest);
+            }
+        }
+
+        async startBatch() {
+            if (this.busy) return;
+            if (this.store.load()?.active) {
+                this.ui.setStatus('请先暂停当前采集，再启动后台批量采集', 'normal');
+                return;
+            }
+            if (!this.adapter.supportsBatchCollection()) {
+                this.ui.setStatus('当前页面不支持后台批量采集，请使用逐题采集', 'error');
+                return;
+            }
+            if (!this.settingsStore.load().autoRevealAnswer) {
+                this.ui.setStatus('请先开启“未作答题自动点击显示答案”，再使用后台批量采集', 'normal');
+                return;
+            }
+            const total = this.adapter.detectTotal();
+            if (!Number.isInteger(total) || total < 1) {
+                this.ui.setStatus('无法识别总题数，请使用逐题采集', 'error');
+                return;
+            }
+            const controller = new AbortController();
+            this.batchController = controller;
+            this.busy = true;
+            const baseUrl = location.href;
+            let failure = null;
+            try {
+                const session = this.store.load() || this.store.create('batch');
+                session.mode = 'batch';
+                session.active = true;
+                session.phase = 'collecting';
+                session.message = '';
+                session.total = total;
+                if (!this.store.save(session)) throw new Error('无法保存采集进度，采集已停止');
+                const answered = new Set(session.items.filter(item => normalizeText(item.answer)).map(item => Number(item.order)));
+                const pending = Array.from({ length: total }, (_, index) => index + 1).filter(order => !answered.has(order));
+                this.ui.refresh();
+                const readOrder = async order => {
+                    const item = await this.fetchBatchQuestion(order, baseUrl, controller.signal);
+                    if (controller.signal.aborted) return;
+                    const latest = this.store.load();
+                    if (!latest?.active || latest.mode !== 'batch') {
+                        controller.abort();
+                        return;
+                    }
+                    this.store.addItem(latest, item);
+                    latest.lastOrder = order;
+                    if (!this.store.save(latest)) throw new Error('无法保存采集进度，采集已停止');
+                    this.ui.refresh();
+                };
+                // 先验证一题能返回匹配的题号和答案，再开启有限并发。
+                if (pending.length) {
+                    this.ui.setStatus(`正在验证第 ${pending[0]} 题的后台读取…`, 'active');
+                    await readOrder(pending.shift());
+                }
+                let nextIndex = 0;
+                const worker = async () => {
+                    while (!controller.signal.aborted && nextIndex < pending.length) {
+                        const order = pending[nextIndex++];
+                        try {
+                            await readOrder(order);
+                            await sleep(120);
+                        } catch (error) {
+                            if (!controller.signal.aborted) {
+                                failure = error;
+                                controller.abort();
+                            }
+                        }
+                    }
+                };
+                await Promise.all(Array.from({ length: APP.batchConcurrency }, worker));
+                if (failure) throw failure;
+                const latest = this.store.load();
+                if (!controller.signal.aborted && latest?.active) this.finish(latest, 'completed');
+            } catch (error) {
+                const wasAborted = controller.signal.aborted;
+                controller.abort();
+                const latest = this.store.load();
+                if (latest?.active) this.finish(latest, 'error', error.message || '后台批量采集失败，已读取进度会保留');
+                else if (!wasAborted) this.ui.setStatus(error.message || '后台批量采集失败', 'error');
+            } finally {
+                this.busy = false;
+                if (this.batchController === controller) this.batchController = null;
             }
         }
 
@@ -5413,7 +5588,11 @@ ${optionsText}`;
 
                 const isWaitingForReveal = session.phase === 'revealing' &&
                     Number(session.pendingAnswerOrder) === Number(item.order);
-                if (!item.answer) {
+                const settings = this.settingsStore.load();
+                const canRevealImmediately = !item.answer && !isWaitingForReveal && settings.autoRevealAnswer &&
+                    this.adapter.findShowAnswer() &&
+                    Number(session.revealAttempts[item.order] || 0) < APP.maxRevealAttempts;
+                if (!item.answer && !canRevealImmediately) {
                     const loaded = await this.adapter.waitForAnswer(
                         currentNode,
                         item.order,
@@ -5425,7 +5604,6 @@ ${optionsText}`;
                     }
                 }
 
-                const settings = this.settingsStore.load();
                 if (!item.answer && settings.autoRevealAnswer && !isWaitingForReveal) {
                     const reveal = this.adapter.findShowAnswer();
                     const attempts = Number(session.revealAttempts[item.order] || 0);
@@ -5496,6 +5674,15 @@ ${optionsText}`;
         autoResume() {
             clearTimeout(this.resumeTimer);
             const session = this.store.load();
+            if (session?.active && session.mode === 'batch') {
+                session.active = false;
+                session.phase = 'paused';
+                session.message = '页面已重新加载，点击“后台批量采集”继续';
+                this.store.save(session);
+                this.ui.refresh();
+                this.ui.setStatus(session.message, 'normal');
+                return;
+            }
             if (session?.active && session.mode === 'paged') {
                 this.resumeTimer = setTimeout(() => this.resume(), 250);
             }
@@ -5562,6 +5749,7 @@ ${optionsText}`;
         if (!adapter.hasQuestions() && !isStudyTopPage) return false;
         ui.mount();
         ui.on('start', () => collector.start());
+        ui.on('batch', () => collector.startBatch());
         ui.on('scan', () => collector.scanCurrentPage());
         ui.on('pause', () => collector.pause());
         ui.on('clear', () => collector.clear());
@@ -5656,7 +5844,7 @@ ${optionsText}`;
     const MODULE = Object.freeze({
         id: 'cx-study-autoplayer',
         name: '学习通超级工具·自动刷课',
-        version: '1.5.7-image-ai-tw',
+        version: '1.5.8-image-ai-tw',
         settingsKey: 'CX_STUDY_AUTOPLAYER_SETTINGS',
     });
 
