@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通超级工具
 // @namespace    https://github.com/zenghaolinz/chaoxing-learning-super-tool
-// @version      1.5.5-image-ai
+// @version      1.5.6-image-ai-tw
 // @description  学习通超级工具：题目采集/导出/AI答题/回填 + 视频自动播放、保活、自动下一节、章节测验 AI 作答，统一浮窗开关
 // @author       zenghaolinz
 // @license      MIT
@@ -42,7 +42,7 @@
     const APP = Object.freeze({
         id: 'cx-answer-exporter',
         name: '学习通超级工具',
-        version: '1.5.5-image-ai',
+        version: '1.5.6-image-ai-tw',
         storageVersion: 1,
         sessionPrefix: 'CXAE_SESSION_',
         settingsKey: 'CXAE_SETTINGS',
@@ -666,7 +666,7 @@
 
         inferVueQuestionType(question, options, answer) {
             const rawType = question?.questionTypeName ?? question?.typeName ?? question?.questionType ?? question?.questiontype ?? question?.type;
-            if (typeof rawType === 'string' && /题/.test(rawType)) return normalizeText(rawType);
+            if (typeof rawType === 'string' && /[题題]/.test(rawType)) return this.normalizeQuestionType(rawType);
 
             const optionContents = this.getVueOptionObjects(question)
                 .map(option => this.htmlToText(option?.content ?? option?.value ?? option?.text ?? ''))
@@ -1037,8 +1037,8 @@
         extractQuestionNumber(value) {
             const text = String(value || '').replace(/\r/g, '');
             const patterns = [
-                /(?:^|\n)\s*(\d{1,5})\s*[.、．]\s*(?:[（(][^）)\n]*题[^）)\n]*[）)]\s*)?/,
-                /(?:^|\n)\s*第\s*(\d{1,5})\s*题(?:\s|$|[：:])/,
+                /(?:^|\n)\s*(\d{1,5})\s*[.、．]\s*(?:[（(][^）)\n]*[题題][^）)\n]*[）)]\s*)?/,
+                /(?:^|\n)\s*第\s*(\d{1,5})\s*[题題](?:\s|$|[：:])/,
                 /^\s*(\d{1,5})\s*[.、．]/,
             ];
 
@@ -1074,7 +1074,7 @@
         inferQuestionType(title) {
             const text = String(title || '');
             const match =
-                text.match(/[（(]\s*([^）)]+题)\s*[）)]/) ||
+                text.match(/[（(]\s*([^）)]+[题題])\s*[）)]/) ||
                 text.match(/[\[【]\s*([^\]】]+(?:题|題))\s*[\]】]/);
             return match ? this.normalizeQuestionType(match[1]) : '未分类';
         }
@@ -1121,12 +1121,12 @@
             for (const selector of selectors) {
                 for (const element of question.querySelectorAll(selector)) {
                     const value = this.cleanAnswer(element.textContent);
-                    if (value && value !== '正确答案') return value;
+                    if (value && !/^(?:正确答案|正確答案|显示答案|顯示答案|显示正确答案|顯示正確答案)$/.test(value)) return value;
                 }
             }
 
             const answerLabels = ['正确答案', '正確答案', '参考答案', '參考答案', '标准答案', '標準答案'];
-            const stopLabels = ['答案解析', '答案詳解', '答案详解', '题目解析', '題目解析', '难易度', '難易度', '知识点', '知識點', '上一题', '上一題', '下一题', '下一題'];
+            const stopLabels = ['答案解析', '答案詳解', '答案详解', '题目解析', '題目解析', '难易度', '難易度', '知识点', '知識點', '上一题', '上一題', '下一题', '下一題', '显示答案', '顯示答案', '顯示正確答案', '显示正确答案'];
             for (const answerLabel of answerLabels) {
                 const labeled = this.cleanAnswer(this.getLabeledSection(question, answerLabel, stopLabels));
                 if (labeled) return labeled;
@@ -1255,7 +1255,7 @@
 
             if (!title) {
                 const lines = this.getLines(question);
-                title = lines.find(line => !/^(我的答案|正確答案|正确答案|答案解析|题目解析|難易度|难易度|知识点|知識點)/.test(line)) || '';
+                title = lines.find(line => !/^(我的答案|正確答案|正确答案|參考答案|参考答案|標準答案|标准答案|答案解析|答案詳解|题目解析|題目解析|難易度|难易度|知识点|知識點|顯示答案|显示答案)/.test(line)) || '';
             }
             if (!title) return null;
 
@@ -1312,9 +1312,10 @@
             const text = String(document.body?.innerText || '');
             const values = [];
             const patterns = [
-                /共\s*(\d+)\s*题/g,
-                /题量\s*[:：]\s*(\d+)/g,
-                /总题数\s*[:：]\s*(\d+)/g,
+                /共\s*(\d+)\s*[题題]/g,
+                /[题題]量\s*[:：]\s*(\d+)/g,
+                /[总總][题題]数\s*[:：]\s*(\d+)/g,
+                /[总總][题題]數\s*[:：]\s*(\d+)/g,
             ];
 
             for (const pattern of patterns) {
@@ -1401,13 +1402,41 @@
         }
 
         findShowAnswer(question = null) {
-            return this.findTextAction('显示答案', question || document);
+            const root = question || document;
+            // 超星的繁体界面使用“顯示答案”，有些页面写作“顯示正確答案”。
+            // 保留简体匹配；先按可点击按钮文字精确查找，避免误点题干中的文字。
+            const labels = [
+                '显示答案', '顯示答案',
+                '显示正确答案', '显示正確答案',
+                '顯示正确答案', '顯示正確答案',
+            ];
+            for (const label of labels) {
+                const button = this.findTextAction(label, root);
+                if (button) return button;
+            }
+
+            // 图标按钮的说明可能只写在 aria-label/title/value 中；允许中间有空格。
+            const pattern = /^(?:显示|顯示)\s*(?:(?:正确|正確)\s*)?答案$/;
+            const candidates = root.querySelectorAll(
+                'a, button, input[type="button"], input[type="submit"], [role="button"], [onclick]'
+            );
+            for (const button of candidates) {
+                if (button.closest?.(`#${APP.id}-host`) || !isVisible(button) || isDisabled(button)) continue;
+                const hints = [
+                    button.getAttribute?.('aria-label'),
+                    button.getAttribute?.('title'),
+                    button.getAttribute?.('data-title'),
+                    button.tagName === 'INPUT' ? button.value : '',
+                ];
+                if (hints.some(hint => pattern.test(normalizeText(hint || '')))) return button;
+            }
+            return null;
         }
 
         findNavigation(label) {
             const aliases = {
-                '下一题': ['下一题', '下题', '后一题', '下一页', '下一步', '下一个'],
-                '上一题': ['上一题', '上题', '前一题', '上一页', '上一个'],
+                '下一题': ['下一题', '下一題', '下题', '下題', '后一题', '後一題', '下一页', '下一頁', '下一步', '下一个', '下一個'],
+                '上一题': ['上一题', '上一題', '上题', '上題', '前一题', '前一題', '上一页', '上一頁', '上一个', '上一個'],
             };
             const labels = aliases[label] || [label];
             for (const candidate of labels) {
@@ -1417,9 +1446,9 @@
 
             // 部分新版页面只在 aria-label/title 中标注翻页含义，按钮正文是图标。
             const attributePattern = label === '下一题'
-                ? /下一题|下题|后一题|下一页|下一步|下一个|next/i
+                ? /下一[题題]|下[题題]|[后後]一[题題]|下一[页頁]|下一步|下一[个個]|next/i
                 : label === '上一题'
-                    ? /上一题|上题|前一题|上一页|上一个|previous|prev/i
+                    ? /上一[题題]|上[题題]|前一[题題]|上一[页頁]|上一[个個]|previous|prev/i
                     : new RegExp(String(label), 'i');
             const candidates = Array.from(document.querySelectorAll(
                 'a, button, input[type="button"], input[type="submit"], [role="button"], [onclick]'
@@ -5609,7 +5638,7 @@ ${optionsText}`;
     const MODULE = Object.freeze({
         id: 'cx-study-autoplayer',
         name: '学习通超级工具·自动刷课',
-        version: '1.5.5-image-ai',
+        version: '1.5.6-image-ai-tw',
         settingsKey: 'CX_STUDY_AUTOPLAYER_SETTINGS',
     });
 
