@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通超级工具
 // @namespace    https://github.com/zenghaolinz/chaoxing-learning-super-tool
-// @version      1.5.9-image-ai-tw
+// @version      1.5.10-image-ai-tw
 // @description  学习通超级工具：题目采集/导出/AI答题/回填 + 视频自动播放、保活、自动下一节、章节测验 AI 作答，统一浮窗开关
 // @author       zenghaolinz
 // @license      MIT
@@ -42,7 +42,7 @@
     const APP = Object.freeze({
         id: 'cx-answer-exporter',
         name: '学习通超级工具',
-        version: '1.5.9-image-ai-tw',
+        version: '1.5.10-image-ai-tw',
         storageVersion: 1,
         sessionPrefix: 'CXAE_SESSION_',
         settingsKey: 'CXAE_SETTINGS',
@@ -1301,7 +1301,8 @@
                 return url.origin === location.origin &&
                     /(^|\.)chaoxing\.com$/i.test(url.hostname) &&
                     url.pathname === '/exam-ans/exam/test/reVersionTestStartNew' &&
-                    ['courseId', 'classId', 'tId', 'id', 'start'].every(key => /^\d+$/.test(url.searchParams.get(key) || ''));
+                    ['courseId', 'classId', 'tId', 'id'].every(key => /^\d+$/.test(url.searchParams.get(key) || '')) &&
+                    (!url.searchParams.has('start') || /^\d+$/.test(url.searchParams.get('start') || ''));
             } catch {
                 return false;
             }
@@ -1311,6 +1312,8 @@
             if (!this.supportsBatchCollection(href)) throw new Error('当前页面不支持后台批量采集，请使用逐题采集');
             if (!Number.isInteger(order) || order < 1) throw new Error('批量采集题号无效');
             const url = new URL(href);
+            // 考试入口可省略 start；tag=1 会恢复上次题目，覆盖显式分页，不能带入逐题读取链接。
+            if (url.searchParams.get('tag') === '1') url.searchParams.delete('tag');
             url.searchParams.set('start', String(order - 1));
             url.searchParams.set('answeredView', '1');
             return url.href;
@@ -5848,7 +5851,7 @@ ${optionsText}`;
     const MODULE = Object.freeze({
         id: 'cx-study-autoplayer',
         name: '学习通超级工具·自动刷课',
-        version: '1.5.9-image-ai-tw',
+        version: '1.5.10-image-ai-tw',
         settingsKey: 'CX_STUDY_AUTOPLAYER_SETTINGS',
     });
 

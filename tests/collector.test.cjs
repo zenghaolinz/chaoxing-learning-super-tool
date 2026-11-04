@@ -15,11 +15,11 @@ function page(order, { correct = 'D', role = 'radio', values = contents, answer 
         return `<div class="clearfix answerBg singleoption" role="${role}"><span class="num_option${correct.includes(label) ? ' success' : ''}" data="${label}">${correct.includes(label) ? '' : label}</span><div class="answer_p">${text}</div></div>`;
     }).join('\n') + `</div><div class="eye_answer"><div class="same status1"><span class="myvacancy">正确答案:</span><span class="yoursanswer">${answer}</span></div></div><div>上一题 下一题</div><div>标记</div><script>globalThis.untrustedPageRan = true</script></div></body></html>`;
 }
-function harness({ total = 5, fetchImpl, autoReveal = true } = {}) {
+function harness({ total = 5, fetchImpl, autoReveal = true, href = baseUrl } = {}) {
     const memory = new Map();
     const context = vm.createContext({
         URL, DOMParser, AbortController, setTimeout, clearTimeout, console,
-        location: { href: baseUrl, origin: new URL(baseUrl).origin },
+        location: { href, origin: new URL(href).origin },
         document: parseHTML(page(1)).document,
         localStorage: {
             getItem: key => memory.get(key) ?? null,
@@ -58,6 +58,45 @@ test('supports only the observed same-origin exam route and valid one-based orde
     assert.equal(url.searchParams.get('answeredView'), '1');
     assert.equal(url.searchParams.get('enc'), 'test-signature');
     assert.throws(() => adapter.getBatchPageUrl(0), /题号无效/);
+});
+
+test('entry links without start are supported and tag=1 is removed from numbered requests', async () => {
+    const entry = new URL(baseUrl);
+    entry.searchParams.delete('start');
+    entry.searchParams.set('tag', '1');
+    const requests = [];
+    const h = harness({ href: entry.href, total: 3, fetchImpl: async url => {
+        const request = new URL(url);
+        assert.equal(request.searchParams.has('tag'), false);
+        assert.equal(request.searchParams.get('enc'), 'test-signature');
+        const order = Number(request.searchParams.get('start')) + 1;
+        requests.push(order);
+        return { ok: true, url, text: async () => page(order) };
+    }});
+    assert.equal(h.adapter.supportsBatchCollection(), true);
+    const firstUrl = new URL(h.adapter.getBatchPageUrl(1));
+    assert.equal(firstUrl.searchParams.get('start'), '0');
+    assert.equal(firstUrl.searchParams.get('answeredView'), '1');
+    assert.equal(firstUrl.searchParams.has('tag'), false);
+    assert.equal(entry.searchParams.has('start'), false);
+    assert.equal(entry.searchParams.get('tag'), '1');
+    await h.collector.startBatch();
+    assert.deepEqual(requests.slice().sort((a, b) => a - b), [1, 2, 3]);
+    assert.equal(h.store.load().phase, 'completed');
+});
+
+test('optional start still rejects malformed offsets and missing paper identifiers', () => {
+    const { adapter } = harness();
+    for (const start of ['', '-1', 'abc', '1.5']) {
+        const url = new URL(baseUrl);
+        url.searchParams.set('start', start);
+        assert.equal(adapter.supportsBatchCollection(url.href), false);
+    }
+    for (const key of ['courseId', 'classId', 'tId', 'id']) {
+        const url = new URL(baseUrl);
+        url.searchParams.delete(key);
+        assert.equal(adapter.supportsBatchCollection(url.href), false);
+    }
 });
 
 test('detached HTML parsing restores the correct option label without running scripts', () => {
